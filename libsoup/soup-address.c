@@ -466,6 +466,15 @@ soup_address_get_sockaddr (SoupAddress *addr, int *len)
 	return priv->sockaddr;
 }
 
+GSocketAddress *
+soup_address_get_gsockaddr (SoupAddress *addr)
+{
+	SoupAddressPrivate *priv = SOUP_ADDRESS_GET_PRIVATE (addr);
+
+	return g_socket_address_new_from_native (priv->sockaddr,
+						 SOUP_ADDRESS_FAMILY_SOCKADDR_SIZE (SOUP_ADDRESS_GET_FAMILY (priv)));
+}
+
 static GInetAddress *
 soup_address_make_inet_address (SoupAddress *addr)
 {

@@ -35,18 +35,7 @@
  * soup_socket_get_remote_address()) may be useful to applications.
  **/
 
-static void
-_soup_networking_init (void)
-{
-#ifdef G_OS_WIN32
-  WSADATA wsadata;
-  if (WSAStartup (MAKEWORD (2, 0), &wsadata) != 0)
-    g_error ("Windows Sockets could not be initialized");
-#endif
-}
-
-G_DEFINE_TYPE_WITH_CODE (SoupSocket, soup_socket, G_TYPE_OBJECT,
-			 _soup_networking_init ();)
+G_DEFINE_TYPE (SoupSocket, soup_socket, G_TYPE_OBJECT)
 
 enum {
 	READABLE,
@@ -78,11 +67,10 @@ enum {
 typedef struct {
 	int sockfd;
 	SoupAddress *local_addr, *remote_addr;
-	GIOChannel *iochannel;
+	GSocket *gsock;
 
 	guint non_blocking:1;
 	guint is_server:1;
-	guint timed_out:1;
 	guint ssl_strict:1;
 	guint trusted_certificate:1;
 	guint clean_dispose:1;
@@ -91,8 +79,6 @@ typedef struct {
 	GMainContext   *async_context;
 	GSource        *watch_src;
 	GSource        *read_src, *write_src;
-	GSource        *read_timeout, *write_timeout;
-	GSource        *connect_timeout;
 	GByteArray     *read_buf;
 
 	GMutex *iolock, *addrlock;
@@ -108,14 +94,10 @@ static void get_property (GObject *object, guint prop_id,
 			  GValue *value, GParamSpec *pspec);
 
 #ifdef G_OS_WIN32
-#define SOUP_IS_SOCKET_ERROR(status) ((status) == SOCKET_ERROR)
 #define SOUP_IS_INVALID_SOCKET(socket) ((socket) == INVALID_SOCKET)
-#define SOUP_IS_CONNECT_STATUS_INPROGRESS() (WSAGetLastError () == WSAEWOULDBLOCK)
 #define SHUT_RDWR SD_BOTH
 #else
-#define SOUP_IS_SOCKET_ERROR(status) ((status) == -1)
 #define SOUP_IS_INVALID_SOCKET(socket) ((socket) < 0)
-#define SOUP_IS_CONNECT_STATUS_INPROGRESS() (errno == EINPROGRESS)
 #endif
 
 static void
@@ -133,9 +115,9 @@ soup_socket_init (SoupSocket *sock)
 static void
 disconnect_internal (SoupSocketPrivate *priv)
 {
-	if (priv->iochannel) {
-		g_io_channel_unref (priv->iochannel);
-		priv->iochannel = NULL;
+	if (priv->gsock) {
+		g_object_unref (priv->gsock);
+		priv->gsock = NULL;
 	}
 	priv->sockfd = -1;
 
@@ -146,14 +128,6 @@ disconnect_internal (SoupSocketPrivate *priv)
 	if (priv->write_src) {
 		g_source_destroy (priv->write_src);
 		priv->write_src = NULL;
-	}
-	if (priv->read_timeout) {
-		g_source_destroy (priv->read_timeout);
-		priv->read_timeout = NULL;
-	}
-	if (priv->write_timeout) {
-		g_source_destroy (priv->write_timeout);
-		priv->write_timeout = NULL;
 	}
 }
 
@@ -167,7 +141,7 @@ finalize (GObject *object)
 			g_warning ("Disposing socket %p during connect", object);
 		g_object_unref (priv->connect_cancel);
 	}
-	if (priv->iochannel) {
+	if (priv->gsock) {
 		if (priv->clean_dispose)
 			g_warning ("Disposing socket %p while still connected", object);
 		disconnect_internal (priv);
@@ -182,11 +156,6 @@ finalize (GObject *object)
 		if (priv->clean_dispose && !priv->is_server)
 			g_warning ("Disposing socket %p during async op", object);
 		g_source_destroy (priv->watch_src);
-	}
-	if (priv->connect_timeout) {
-		if (priv->clean_dispose)
-			g_warning ("Disposing socket %p during connect (2)", object);
-		g_source_destroy (priv->connect_timeout);
 	}
 	if (priv->async_context)
 		g_main_context_unref (priv->async_context);
@@ -204,10 +173,6 @@ static void
 soup_socket_class_init (SoupSocketClass *socket_class)
 {
 	GObjectClass *object_class = G_OBJECT_CLASS (socket_class);
-
-#ifdef SIGPIPE
-	signal (SIGPIPE, SIG_IGN);
-#endif
 
 	g_type_class_add_private (socket_class, sizeof (SoupSocketPrivate));
 
@@ -442,93 +407,20 @@ soup_socket_class_init (SoupSocketClass *socket_class)
 
 
 static void
-set_nonblocking (SoupSocketPrivate *priv)
-{
-#ifndef G_OS_WIN32
-	int flags;
-#else
-	u_long val;
-#endif
-
-	if (priv->sockfd == -1)
-		return;
-
-#ifndef G_OS_WIN32
-	flags = fcntl (priv->sockfd, F_GETFL, 0);
-	if (flags != -1) {
-		if (priv->non_blocking)
-			flags |= O_NONBLOCK;
-		else
-			flags &= ~O_NONBLOCK;
-		fcntl (priv->sockfd, F_SETFL, flags);
-	}
-#else
-	val = priv->non_blocking ? 1 : 0;
-	ioctlsocket (priv->sockfd, FIONBIO, &val);
-#endif
-}
-
-static void
 set_fdflags (SoupSocketPrivate *priv)
 {
 	int opt;
-#ifndef G_OS_WIN32
-	struct timeval timeout;
-	int flags;
-#endif
 
 	if (priv->sockfd == -1)
 		return;
-
-	set_nonblocking (priv);
-
-#ifndef G_OS_WIN32
-	flags = fcntl (priv->sockfd, F_GETFD, 0);
-	if (flags != -1) {
-		flags |= FD_CLOEXEC;
-		fcntl (priv->sockfd, F_SETFD, flags);
-	}
-#endif
 
 	opt = 1;
 	setsockopt (priv->sockfd, IPPROTO_TCP,
 		    TCP_NODELAY, (void *) &opt, sizeof (opt));
-	setsockopt (priv->sockfd, SOL_SOCKET,
-		    SO_REUSEADDR, (void *) &opt, sizeof (opt));
 
-#ifndef G_OS_WIN32
-	timeout.tv_sec = priv->timeout;
-	timeout.tv_usec = 0;
-	setsockopt (priv->sockfd, SOL_SOCKET,
-		    SO_RCVTIMEO, (void *) &timeout, sizeof (timeout));
-
-	timeout.tv_sec = priv->timeout;
-	timeout.tv_usec = 0;
-	setsockopt (priv->sockfd, SOL_SOCKET,
-		    SO_SNDTIMEO, (void *) &timeout, sizeof (timeout));
-#else
-	if (priv->timeout < G_MAXINT / 1000)
-		opt = priv->timeout * 1000;
-	else
-		opt = 0;
-
-	setsockopt (priv->sockfd, SOL_SOCKET,
-		    SO_RCVTIMEO, (void *) &opt, sizeof (opt));
-	
-	setsockopt (priv->sockfd, SOL_SOCKET,
-		    SO_SNDTIMEO, (void *) &opt, sizeof (opt));
-#endif
-
-#ifndef G_OS_WIN32
-	priv->iochannel =
-		g_io_channel_unix_new (priv->sockfd);
-#else
-	priv->iochannel =
-		g_io_channel_win32_new_socket (priv->sockfd);
-#endif
-	g_io_channel_set_close_on_unref (priv->iochannel, TRUE);
-	g_io_channel_set_encoding (priv->iochannel, NULL, NULL);
-	g_io_channel_set_buffered (priv->iochannel, FALSE);
+	priv->gsock = g_socket_new_from_fd (priv->sockfd, NULL);
+	g_socket_set_blocking (priv->gsock, !priv->non_blocking);
+	g_socket_set_io_timeout (priv->gsock, priv->timeout);
 }
 
 static void
@@ -546,7 +438,8 @@ set_property (GObject *object, guint prop_id,
 		break;
 	case PROP_NON_BLOCKING:
 		priv->non_blocking = g_value_get_boolean (value);
-		set_nonblocking (priv);
+		if (priv->gsock)
+			g_socket_set_blocking (priv->gsock, !priv->non_blocking);
 		break;
 	case PROP_SSL_CREDENTIALS:
 		priv->ssl_creds = g_value_get_pointer (value);
@@ -564,6 +457,8 @@ set_property (GObject *object, guint prop_id,
 		break;
 	case PROP_TIMEOUT:
 		priv->timeout = g_value_get_uint (value);
+		if (priv->gsock)
+			g_socket_set_io_timeout (priv->gsock, priv->timeout);
 		break;
 	case PROP_CLEAN_DISPOSE:
 		priv->clean_dispose = g_value_get_boolean (value);
@@ -641,7 +536,6 @@ soup_socket_new (const char *optname1, ...)
 typedef struct {
 	SoupSocket *sock;
 	GCancellable *cancellable;
-	guint cancel_id;
 	SoupSocketCallback callback;
 	gpointer user_data;
 } SoupSocketAsyncConnectData;
@@ -649,8 +543,6 @@ typedef struct {
 static void
 free_sacd (SoupSocketAsyncConnectData *sacd)
 {
-	if (sacd->cancel_id)
-		g_signal_handler_disconnect (sacd->cancellable, sacd->cancel_id);
 	g_object_unref (sacd->cancellable);
 	g_object_unref (sacd->sock);
 	g_slice_free (SoupSocketAsyncConnectData, sacd);
@@ -686,43 +578,19 @@ idle_connect_result (gpointer user_data)
 }
 
 static gboolean
-connect_watch (GIOChannel* iochannel, GIOCondition condition, gpointer data)
+connect_watch (GSocket *sock, GIOCondition condition, gpointer data)
 {
 	SoupSocketAsyncConnectData *sacd = data;
 	SoupSocketPrivate *priv = SOUP_SOCKET_GET_PRIVATE (sacd->sock);
-	int error = 0;
-	int len = sizeof (error);
 
 	/* Remove the watch now in case we don't return immediately */
 	g_source_destroy (priv->watch_src);
 	priv->watch_src = NULL;
-	if (priv->connect_timeout) {
-		g_source_destroy (priv->connect_timeout);
-		priv->connect_timeout = NULL;
-	}
 
-	if ((condition & ~(G_IO_IN | G_IO_OUT)) ||
-	    (getsockopt (priv->sockfd, SOL_SOCKET, SO_ERROR,
-			 (void *)&error, (void *)&len) != 0) ||
-	    error)
+	if (g_cancellable_is_cancelled (sacd->cancellable) ||
+	    !g_socket_check_connect_result (priv->gsock, NULL))
 		disconnect_internal (priv);
 
-	return idle_connect_result (sacd);
-}
-
-static gboolean
-connect_timeout (gpointer data)
-{
-	SoupSocketAsyncConnectData *sacd = data;
-	SoupSocketPrivate *priv = SOUP_SOCKET_GET_PRIVATE (sacd->sock);
-
-	/* Remove the watch now in case we don't return immediately */
-	g_source_destroy (priv->watch_src);
-	priv->watch_src = NULL;
-	g_source_destroy (priv->connect_timeout);
-	priv->connect_timeout = NULL;
-
-	disconnect_internal (priv);
 	return idle_connect_result (sacd);
 }
 
@@ -743,45 +611,60 @@ got_address (SoupAddress *addr, guint status, gpointer user_data)
 	free_sacd (sacd);
 }
 
-static void
-async_cancel (GCancellable *cancellable, gpointer user_data)
-{
-	SoupSocketAsyncConnectData *sacd = user_data;
-	SoupSocketPrivate *priv = SOUP_SOCKET_GET_PRIVATE (sacd->sock);
-
-	if (priv->watch_src)
-		g_source_destroy (priv->watch_src);
-	disconnect_internal (priv);
-	priv->watch_src = soup_add_completion (priv->async_context,
-					       idle_connect_result, sacd);
-}
-
 static guint
-socket_connect_internal (SoupSocket *sock)
+socket_connect_internal (SoupSocket *sock, GCancellable *cancellable)
 {
 	SoupSocketPrivate *priv = SOUP_SOCKET_GET_PRIVATE (sock);
-	struct sockaddr *sa;
-	int len, status;
+	GSocketAddress *addr;
+	GError *error = NULL;
 
-	sa = soup_address_get_sockaddr (priv->remote_addr, &len);
-	if (!sa)
+	addr = soup_address_get_gsockaddr (priv->remote_addr);
+	if (!addr)
 		return SOUP_STATUS_CANT_RESOLVE;
 
-	priv->sockfd = socket (sa->sa_family, SOCK_STREAM, 0);
+	priv->sockfd = socket (g_socket_address_get_family (addr),
+			       SOCK_STREAM, 0);
 	if (SOUP_IS_INVALID_SOCKET (priv->sockfd))
 		return SOUP_STATUS_CANT_CONNECT;
 	set_fdflags (priv);
 
-	status = connect (priv->sockfd, sa, len);
+	if (priv->non_blocking) {
+		if (g_socket_connect (priv->gsock, addr, cancellable, &error))
+			return SOUP_STATUS_OK;
 
-	if (SOUP_IS_SOCKET_ERROR (status)) {
-		if (SOUP_IS_CONNECT_STATUS_INPROGRESS ())
+		if (error->domain == G_IO_ERROR &&
+		    error->code == G_IO_ERROR_PENDING) {
+			g_error_free (error);
 			return SOUP_STATUS_CONTINUE;
+		}
+		g_error_free (error);
+	} else {
+		if (!g_socket_condition_wait (priv->gsock, G_IO_OUT,
+					      cancellable, NULL)) {
+			disconnect_internal (priv);
+			return SOUP_STATUS_CANCELLED;
+		}
+		if (g_socket_connect (priv->gsock, addr, cancellable, NULL))
+			return SOUP_STATUS_OK;
+	}
 
-		disconnect_internal (priv);
-		return SOUP_STATUS_CANT_CONNECT;
-	} else
-		return SOUP_STATUS_OK;
+	disconnect_internal (priv);
+	return SOUP_STATUS_CANT_CONNECT;
+}
+
+static GSource *
+soup_socket_create_watch (SoupSocketPrivate *priv, GIOCondition cond,
+			  GSocketSourceFunc callback, gpointer user_data,
+			  GCancellable *cancellable)
+{
+	GSource *watch;
+
+	watch = g_socket_create_source (priv->gsock, cond, cancellable);
+	g_source_set_callback (watch, (GSourceFunc)callback, user_data, NULL);
+	g_source_attach (watch, priv->async_context);
+	g_source_unref (watch);
+
+	return watch;
 }
 
 /**
@@ -842,38 +725,20 @@ soup_socket_connect_async (SoupSocket *sock, GCancellable *cancellable,
 		return;
 	}
 
-	status = socket_connect_internal (sock);
+	status = socket_connect_internal (sock, NULL);
 	if (status == SOUP_STATUS_CONTINUE) {
 		/* Wait for connect to succeed or fail */
 		priv->watch_src =
-			soup_add_io_watch (priv->async_context,
-					   priv->iochannel,
-					   G_IO_IN | G_IO_OUT |
-					   G_IO_PRI | G_IO_ERR |
-					   G_IO_HUP | G_IO_NVAL,
-					   connect_watch, sacd);
-		if (priv->timeout) {
-			priv->connect_timeout =
-				soup_add_timeout (priv->async_context,
-						  priv->timeout * 1000,
-						  connect_timeout, sacd);
-		}
-		sacd->cancel_id =
-			g_signal_connect (sacd->cancellable, "cancelled",
-					  G_CALLBACK (async_cancel),
-					  sacd);
+			soup_socket_create_watch (priv,
+						  G_IO_IN | G_IO_OUT |
+						  G_IO_PRI | G_IO_ERR |
+						  G_IO_HUP | G_IO_NVAL,
+						  connect_watch, sacd,
+						  cancellable);
 	} else {
 		priv->watch_src = soup_add_completion (priv->async_context,
 						       idle_connect_result, sacd);
 	}
-}
-
-static void
-sync_cancel (GCancellable *cancellable, gpointer sock)
-{
-	SoupSocketPrivate *priv = SOUP_SOCKET_GET_PRIVATE (sock);
-
-	shutdown (priv->sockfd, SHUT_RDWR);
 }
 
 /**
@@ -893,7 +758,7 @@ guint
 soup_socket_connect_sync (SoupSocket *sock, GCancellable *cancellable)
 {
 	SoupSocketPrivate *priv;
-	guint status, cancel_id;
+	guint status;
 
 	g_return_val_if_fail (SOUP_IS_SOCKET (sock), SOUP_STATUS_MALFORMED);
 	priv = SOUP_SOCKET_GET_PRIVATE (sock);
@@ -917,21 +782,7 @@ soup_socket_connect_sync (SoupSocket *sock, GCancellable *cancellable)
 		}
 	}
 
-	cancel_id = g_signal_connect (cancellable, "cancelled",
-				      G_CALLBACK (sync_cancel), sock);
-
-	status = socket_connect_internal (sock);
-	priv->connect_cancel = NULL;
-
-	if (status != SOUP_STATUS_OK &&
-	    g_cancellable_is_cancelled (cancellable)) {
-		status = SOUP_STATUS_CANCELLED;
-		disconnect_internal (priv);
-	}
-	g_signal_handler_disconnect (cancellable, cancel_id);
-	g_object_unref (cancellable);
-
-	return status;
+	return socket_connect_internal (sock, cancellable);
 }
 
 int
@@ -943,7 +794,7 @@ soup_socket_get_fd (SoupSocket *sock)
 }
 
 static gboolean
-listen_watch (GIOChannel* iochannel, GIOCondition condition, gpointer data)
+listen_watch (GSocket *gsock, GIOCondition condition, gpointer data)
 {
 	SoupSocket *sock = data, *new;
 	SoupSocketPrivate *priv = SOUP_SOCKET_GET_PRIVATE (sock), *new_priv;
@@ -951,10 +802,11 @@ listen_watch (GIOChannel* iochannel, GIOCondition condition, gpointer data)
 	int sa_len, sockfd;
 
 	if (condition & (G_IO_HUP | G_IO_ERR)) {
-		g_source_destroy (priv->watch_src);
 		priv->watch_src = NULL;
 		return FALSE;
 	}
+
+	/* Using g_socket_accept() here would require more rewriting... */
 
 	sa_len = sizeof (sa);
 	sockfd = accept (priv->sockfd, (struct sockaddr *)&sa, (void *)&sa_len);
@@ -1001,8 +853,7 @@ soup_socket_listen (SoupSocket *sock)
 
 {
 	SoupSocketPrivate *priv;
-	struct sockaddr *sa;
-	int sa_len;
+	GSocketAddress *addr;
 
 	g_return_val_if_fail (SOUP_IS_SOCKET (sock), FALSE);
 	priv = SOUP_SOCKET_GET_PRIVATE (sock);
@@ -1017,33 +868,34 @@ soup_socket_listen (SoupSocket *sock)
 	 * have to make a new addr by calling getsockname(), which
 	 * will have the right port number.
 	 */
-	sa = soup_address_get_sockaddr (priv->local_addr, &sa_len);
-	g_return_val_if_fail (sa != NULL, FALSE);
+	addr = soup_address_get_gsockaddr (priv->local_addr);
+	g_return_val_if_fail (addr != NULL, FALSE);
 
-	priv->sockfd = socket (sa->sa_family, SOCK_STREAM, 0);
+	priv->sockfd = socket (g_socket_address_get_family (addr),
+			       SOCK_STREAM, 0);
 	if (SOUP_IS_INVALID_SOCKET (priv->sockfd))
 		goto cant_listen;
 	set_fdflags (priv);
 
 	/* Bind */
-	if (bind (priv->sockfd, sa, sa_len) != 0)
+	if (!g_socket_bind (priv->gsock, addr, TRUE, NULL))
 		goto cant_listen;
 	/* Force local_addr to be re-resolved now */
 	g_object_unref (priv->local_addr);
 	priv->local_addr = NULL;
 
 	/* Listen */
-	if (listen (priv->sockfd, 10) != 0)
+	if (!g_socket_listen (priv->gsock, NULL))
 		goto cant_listen;
 
-	priv->watch_src = soup_add_io_watch (priv->async_context,
-					     priv->iochannel,
-					     G_IO_IN | G_IO_ERR | G_IO_HUP,
-					     listen_watch, sock);
+	priv->watch_src = soup_socket_create_watch (priv,
+						    G_IO_IN | G_IO_ERR | G_IO_HUP,
+						    listen_watch, sock,
+						    NULL);
 	return TRUE;
 
  cant_listen:
-	if (priv->iochannel)
+	if (priv->gsock)
 		disconnect_internal (priv);
 
 	return FALSE;
@@ -1081,29 +933,7 @@ gboolean
 soup_socket_start_proxy_ssl (SoupSocket *sock, const char *ssl_host,
 			     GCancellable *cancellable)
 {
-	SoupSocketPrivate *priv = SOUP_SOCKET_GET_PRIVATE (sock);
-	GIOChannel *ssl_chan;
-	GIOChannel *real_chan;
-
-	real_chan = priv->iochannel;
-	ssl_chan = soup_ssl_wrap_iochannel (
-		real_chan, priv->non_blocking, priv->is_server ?
-		SOUP_SSL_TYPE_SERVER : SOUP_SSL_TYPE_CLIENT,
-		ssl_host, priv->ssl_creds);
-
-	if (!ssl_chan)
-		return FALSE;
-
-	/* This is optimistic, we will set this to false if we get a
-	 * cert error from one of the I/O calls
-	 */
-	if (priv->ssl_creds)
-		priv->trusted_certificate = TRUE;
-
-	priv->iochannel = ssl_chan;
-	g_io_channel_unref (real_chan);
-
-	return TRUE;
+	return FALSE;
 }
 	
 /**
@@ -1144,7 +974,7 @@ soup_socket_disconnect (SoupSocket *sock)
 		g_cancellable_cancel (priv->connect_cancel);
 		return;
 	} else if (g_mutex_trylock (priv->iolock)) {
-		if (priv->iochannel)
+		if (priv->gsock)
 			disconnect_internal (priv);
 		else
 			already_disconnected = TRUE;
@@ -1153,7 +983,7 @@ soup_socket_disconnect (SoupSocket *sock)
 		int sockfd;
 
 		/* Another thread is currently doing IO, so
-		 * we can't close the iochannel. So just shutdown
+		 * we can't close the socket. So just shutdown
 		 * the file descriptor to force the I/O to fail.
 		 * (It will actually be closed when the socket is
 		 * destroyed.)
@@ -1202,7 +1032,7 @@ soup_socket_is_connected (SoupSocket *sock)
 	g_return_val_if_fail (SOUP_IS_SOCKET (sock), FALSE);
 	priv = SOUP_SOCKET_GET_PRIVATE (sock);
 
-	return priv->iochannel != NULL;
+	return priv->gsock != NULL;
 }
 
 /**
@@ -1267,40 +1097,12 @@ soup_socket_get_remote_address (SoupSocket *sock)
 
 
 static gboolean
-socket_timeout (gpointer sock)
-{
-	SoupSocketPrivate *priv = SOUP_SOCKET_GET_PRIVATE (sock);
-	gboolean readable = FALSE, writable = FALSE;
-
-	priv->timed_out = TRUE;
-	if (priv->read_timeout) {
-		priv->read_timeout = NULL;
-		readable = TRUE;
-	}
-	if (priv->write_timeout) {
-		priv->write_timeout = NULL;
-		writable = TRUE;
-	}
-
-	if (readable)
-		g_signal_emit (sock, signals[READABLE], 0);
-	if (writable)
-		g_signal_emit (sock, signals[WRITABLE], 0);
-
-	return FALSE;
-}
-
-static gboolean
-socket_read_watch (GIOChannel *chan, GIOCondition cond, gpointer user_data)
+socket_read_watch (GSocket *gsock, GIOCondition cond, gpointer user_data)
 {
 	SoupSocket *sock = user_data;
 	SoupSocketPrivate *priv = SOUP_SOCKET_GET_PRIVATE (sock);
 
 	priv->read_src = NULL;
-	if (priv->read_timeout) {
-		g_source_destroy (priv->read_timeout);
-		priv->read_timeout = NULL;
-	}
 
 	if (cond & (G_IO_ERR | G_IO_HUP))
 		soup_socket_disconnect (sock);
@@ -1312,83 +1114,53 @@ socket_read_watch (GIOChannel *chan, GIOCondition cond, gpointer user_data)
 
 static SoupSocketIOStatus
 read_from_network (SoupSocket *sock, gpointer buffer, gsize len,
-		   gsize *nread, GError **error)
+		   gsize *nread, GCancellable *cancellable, GError **error)
 {
 	SoupSocketPrivate *priv = SOUP_SOCKET_GET_PRIVATE (sock);
-	GIOStatus status;
-	GIOCondition cond = G_IO_IN;
 	GError *my_err = NULL;
+	gssize my_nread;
 
 	*nread = 0;
 
-	if (!priv->iochannel)
+	if (!priv->gsock)
 		return SOUP_SOCKET_EOF;
 
-	if (priv->timed_out) {
-		g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT,
-				     "Timed out");
-		return SOUP_SOCKET_ERROR;
-	}
-
-again:
-	status = g_io_channel_read_chars (priv->iochannel,
-					  buffer, len, nread, &my_err);
-	if (my_err) {
-		if (g_error_matches (my_err, SOUP_SSL_ERROR,
-				     SOUP_SSL_ERROR_CERTIFICATE) &&
-		    !priv->ssl_strict) {
-			priv->trusted_certificate = FALSE;
-			g_clear_error (&my_err);
-			goto again;
-		}
-
-		if (g_error_matches (my_err, SOUP_SSL_ERROR,
-				     SOUP_SSL_ERROR_HANDSHAKE_NEEDS_WRITE))
-			cond = G_IO_OUT;
-		g_propagate_error (error, my_err);
-	}
-
-	switch (status) {
-	case G_IO_STATUS_NORMAL:
-	case G_IO_STATUS_AGAIN:
-		if (*nread > 0) {
-			g_clear_error (error);
-			return SOUP_SOCKET_OK;
-		}
-
-		/* If the socket is sync and we get EAGAIN, then it is
-		 * a socket timeout and should be treated as an error
-		 * condition.
-		 */
-		if (!priv->non_blocking) {
-			g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT,
-					     "Timed out");
+	if (!priv->non_blocking) {
+		if (!g_socket_condition_wait (priv->gsock, G_IO_IN,
+					      cancellable, &my_err)) {
+			if (g_error_matches (my_err, G_IO_ERROR, G_IO_ERROR_TIMED_OUT))
+				g_propagate_error (error, my_err);
+			else
+				g_error_free (my_err);
 			return SOUP_SOCKET_ERROR;
 		}
+	}
 
+	my_nread = g_socket_receive (priv->gsock, buffer, len, cancellable, &my_err);
+	if (my_nread > 0) {
+		g_clear_error (&my_err);
+		*nread = my_nread;
+		return SOUP_SOCKET_OK;
+	} else if (my_nread == 0) {
+		g_clear_error (&my_err);
+		*nread = my_nread;
+		return SOUP_SOCKET_EOF;
+	}
+
+	if (g_error_matches (my_err, G_IO_ERROR, G_IO_ERROR_WOULD_BLOCK)) {
+		g_clear_error (&my_err);
 		if (!priv->read_src) {
 			priv->read_src =
-				soup_add_io_watch (priv->async_context,
-						   priv->iochannel,
-						   cond | G_IO_HUP | G_IO_ERR,
-						   socket_read_watch, sock);
-			if (priv->timeout) {
-				priv->read_timeout =
-					soup_add_timeout (priv->async_context,
-							  priv->timeout * 1000,
-							  socket_timeout, sock);
-			}
+				soup_socket_create_watch (priv,
+							  G_IO_IN | G_IO_HUP | G_IO_ERR,
+							  socket_read_watch, sock,
+							  cancellable);
 		}
-		g_clear_error (error);
 		return SOUP_SOCKET_WOULD_BLOCK;
-
-	case G_IO_STATUS_EOF:
-		g_clear_error (error);
-		return SOUP_SOCKET_EOF;
-
-	default:
-		return SOUP_SOCKET_ERROR;
 	}
+
+	g_propagate_error (error, my_err);
+	return SOUP_SOCKET_ERROR;
 }
 
 static SoupSocketIOStatus
@@ -1465,7 +1237,7 @@ soup_socket_read (SoupSocket *sock, gpointer buffer, gsize len,
 	if (priv->read_buf)
 		status = read_from_buf (sock, buffer, len, nread);
 	else
-		status = read_from_network (sock, buffer, len, nread, error);
+		status = read_from_network (sock, buffer, len, nread, cancellable, error);
 	g_mutex_unlock (priv->iolock);
 
 	return status;
@@ -1530,7 +1302,7 @@ soup_socket_read_until (SoupSocket *sock, gpointer buffer, gsize len,
 		g_byte_array_set_size (read_buf, len);
 		status = read_from_network (sock,
 					    read_buf->data + prev_len,
-					    len - prev_len, nread, error);
+					    len - prev_len, nread, cancellable, error);
 		read_buf->len = prev_len + *nread;
 
 		if (status != SOUP_SOCKET_OK) {
@@ -1561,16 +1333,12 @@ soup_socket_read_until (SoupSocket *sock, gpointer buffer, gsize len,
 }
 
 static gboolean
-socket_write_watch (GIOChannel *chan, GIOCondition cond, gpointer user_data)
+socket_write_watch (GSocket *gsock, GIOCondition cond, gpointer user_data)
 {
 	SoupSocket *sock = user_data;
 	SoupSocketPrivate *priv = SOUP_SOCKET_GET_PRIVATE (sock);
 
 	priv->write_src = NULL;
-	if (priv->write_timeout) {
-		g_source_destroy (priv->write_timeout);
-		priv->write_timeout = NULL;
-	}
 
 	if (cond & (G_IO_ERR | G_IO_HUP))
 		soup_socket_disconnect (sock);
@@ -1612,9 +1380,8 @@ soup_socket_write (SoupSocket *sock, gconstpointer buffer,
 		   GCancellable *cancellable, GError **error)
 {
 	SoupSocketPrivate *priv;
-	GIOStatus status;
-	GIOCondition cond = G_IO_OUT;
 	GError *my_err = NULL;
+	gssize my_nwrote;
 
 	g_return_val_if_fail (SOUP_IS_SOCKET (sock), SOUP_SOCKET_ERROR);
 	g_return_val_if_fail (nwrote != NULL, SOUP_SOCKET_ERROR);
@@ -1623,72 +1390,45 @@ soup_socket_write (SoupSocket *sock, gconstpointer buffer,
 
 	g_mutex_lock (priv->iolock);
 
-	if (!priv->iochannel) {
+	if (!priv->gsock) {
 		g_mutex_unlock (priv->iolock);
 		return SOUP_SOCKET_EOF;
-	}
-	if (priv->timed_out) {
-		g_mutex_unlock (priv->iolock);
-		g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT,
-				     "Timed out");
-		return SOUP_SOCKET_ERROR;
 	}
 	if (priv->write_src) {
 		g_mutex_unlock (priv->iolock);
 		return SOUP_SOCKET_WOULD_BLOCK;
 	}
 
-again:
-	status = g_io_channel_write_chars (priv->iochannel,
-					   buffer, len, nwrote, &my_err);
-	if (my_err) {
-		if (g_error_matches (my_err, SOUP_SSL_ERROR,
-				     SOUP_SSL_ERROR_CERTIFICATE) &&
-		    !priv->ssl_strict) {
-			priv->trusted_certificate = FALSE;
-			g_clear_error (&my_err);
-			goto again;
+	if (!priv->non_blocking) {
+		if (!g_socket_condition_wait (priv->gsock, G_IO_OUT,
+					      cancellable, &my_err)) {
+			if (g_error_matches (my_err, G_IO_ERROR, G_IO_ERROR_TIMED_OUT))
+				g_propagate_error (error, my_err);
+			else
+				g_error_free (my_err);
+			return SOUP_SOCKET_ERROR;
 		}
-
-		if (g_error_matches (my_err, SOUP_SSL_ERROR,
-				     SOUP_SSL_ERROR_HANDSHAKE_NEEDS_READ))
-			cond = G_IO_IN;
-		g_propagate_error (error, my_err);
 	}
 
-	/* If the socket is sync and we get EAGAIN, then it is a
-	 * socket timeout and should be treated as an error condition.
-	 */
-	if (!priv->non_blocking && status == G_IO_STATUS_AGAIN) {
+	my_nwrote = g_socket_send (priv->gsock, buffer, len, cancellable, &my_err);
+	if (my_nwrote > 0) {
 		g_mutex_unlock (priv->iolock);
-		g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT,
-				     "Timed out");
-		return SOUP_SOCKET_ERROR;
-	}
-
-	if (status != G_IO_STATUS_NORMAL && status != G_IO_STATUS_AGAIN) {
-		g_mutex_unlock (priv->iolock);
-		return SOUP_SOCKET_ERROR;
-	}
-
-	g_clear_error (error);
-
-	if (*nwrote) {
-		g_mutex_unlock (priv->iolock);
+		g_clear_error (&my_err);
+		*nwrote = my_nwrote;
 		return SOUP_SOCKET_OK;
 	}
 
-	priv->write_src =
-		soup_add_io_watch (priv->async_context,
-				   priv->iochannel,
-				   cond | G_IO_HUP | G_IO_ERR, 
-				   socket_write_watch, sock);
-	if (priv->timeout) {
-		priv->write_timeout = soup_add_timeout (priv->async_context,
-							priv->timeout * 1000,
-							socket_timeout, sock);
+	if (g_error_matches (my_err, G_IO_ERROR, G_IO_ERROR_WOULD_BLOCK)) {
+		g_mutex_unlock (priv->iolock);
+
+		priv->write_src =
+			soup_socket_create_watch (priv,
+						  G_IO_OUT | G_IO_HUP | G_IO_ERR, 
+						  socket_write_watch, sock, cancellable);
+		return SOUP_SOCKET_WOULD_BLOCK;
 	}
 
 	g_mutex_unlock (priv->iolock);
-	return SOUP_SOCKET_WOULD_BLOCK;
+	g_propagate_error (error, my_err);
+	return SOUP_SOCKET_ERROR;
 }
