@@ -22,10 +22,4 @@ SoupSSLCredentials *soup_ssl_get_server_credentials  (const char         *cert_f
 						      const char         *key_file);
 void                soup_ssl_free_server_credentials (SoupSSLCredentials *creds);
 
-GIOChannel         *soup_ssl_wrap_iochannel          (GIOChannel         *sock,
-						      gboolean            non_blocking,
-						      SoupSSLType         type,
-						      const char         *remote_host,
-						      SoupSSLCredentials *creds);
-
 #endif /* SOUP_SSL_H */

@@ -1,61 +1,60 @@
 /* -*- Mode: C; tab-width: 8; indent-tabs-mode: t; c-basic-offset: 8 -*- */
 /*
- * soup-nossl.c
+ * soup-ssl.c: temporary ssl integration
  *
- * Copyright (C) 2003, Ximian, Inc.
+ * Copyright (C) 2010 Red Hat, Inc.
  */
 
 #ifdef HAVE_CONFIG_H
 #include <config.h>
 #endif
 
+#include <gio/gio.h>
+
 #include "soup-ssl.h"
 #include "soup-misc.h"
 
-#ifndef HAVE_SSL
-
-const gboolean soup_ssl_supported = FALSE;
-
-GIOChannel *
-soup_ssl_wrap_iochannel (GIOChannel *sock, gboolean non_blocking,
-			 SoupSSLType type, const char *hostname,
-			 SoupSSLCredentials *creds)
-{
-	return NULL;
-}
+const gboolean soup_ssl_supported = TRUE;
 
 SoupSSLCredentials *
 soup_ssl_get_client_credentials (const char *ca_file)
 {
-	/* We need to return something non-NULL, so SoupSocket will
-	 * realize it's supposed to do SSL. If we returned NULL here,
-	 * we'd eventually end up trying to speak plain http to an
-	 * https server, probably resulting in a SOUP_STATUS_IO_ERROR
-	 * or SOUP_STATUS_MALFORMED instead of SOUP_STATUS_SSL_FAILED.
-	 */
-	return g_malloc (1);
+	GTlsClient *tls;
+
+	tls = g_tls_client_new ();
+	if (ca_file) {
+		GError *error = NULL;
+
+		g_tls_client_set_ca_list_from_file (tls, ca_file, &error);
+		if (error) {
+			g_warning ("Could not set SSL credentials from '%s': %s",
+				   ca_file, error->message);
+			g_error_free (error);
+		}
+	} else
+		g_tls_client_set_validation_flags (tls, 0);
+
+	return (SoupSSLCredentials *)tls;
 }
 
 void
 soup_ssl_free_client_credentials (SoupSSLCredentials *client_creds)
 {
-	g_free (client_creds);
+	g_object_unref (client_creds);
 }
 
 SoupSSLCredentials *
 soup_ssl_get_server_credentials (const char *cert_file, const char *key_file)
 {
-	/* See soup_ssl_get_client_credentials() */
-	return g_malloc (1);
+	/* Not yet implemented */
+	return NULL;
 }
 
 void
 soup_ssl_free_server_credentials (SoupSSLCredentials *server_creds)
 {
-	g_free (server_creds);
+	;
 }
-
-#endif /* ! HAVE_SSL */
 
 /**
  * SOUP_SSL_ERROR:

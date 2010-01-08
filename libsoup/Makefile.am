@@ -144,7 +144,6 @@ libsoup_2_4_la_SOURCES =		\
 	soup-method.c     		\
 	soup-misc.c     		\
 	soup-multipart.c	     	\
-	soup-nossl.c     		\
 	soup-password-manager.c		\
 	soup-path-map.h     		\
 	soup-path-map.c     		\
@@ -160,6 +159,7 @@ libsoup_2_4_la_SOURCES =		\
 	soup-session-sync.c		\
 	soup-socket.c			\
 	soup-ssl.h			\
+	soup-ssl.c	     		\
 	soup-status.c			\
 	soup-uri.c			\
 	soup-value-utils.c		\
