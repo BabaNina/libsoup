@@ -22,9 +22,6 @@
 #include "soup-misc.h"
 #include "soup-ssl.h"
 
-#include <sys/time.h>
-#include <sys/types.h>
-
 /**
  * SECTION:soup-socket
  * @short_description: A network socket
@@ -72,8 +69,9 @@ typedef struct {
 	guint non_blocking:1;
 	guint is_server:1;
 	guint clean_dispose:1;
-
-	GTls *tls;
+	guint ssl_strict:1;
+	guint trusted_certificate:1;
+	GTlsContext *tls_context;
 	GTlsSession *tls_session;
 
 	GMainContext   *async_context;
@@ -163,8 +161,10 @@ finalize (GObject *object)
 	if (priv->read_buf)
 		g_byte_array_free (priv->read_buf, TRUE);
 
-	if (priv->tls)
-		g_object_unref (priv->tls);
+	if (priv->tls_context)
+		g_object_unref (priv->tls_context);
+	if (priv->tls_session)
+		g_object_unref (priv->tls_session);
 
 	g_mutex_free (priv->addrlock);
 	g_mutex_free (priv->iolock);
@@ -344,7 +344,7 @@ soup_socket_class_init (SoupSocketClass *socket_class)
 		g_param_spec_object (SOUP_SOCKET_SSL_CREDENTIALS,
 				     "SSL credentials",
 				     "SSL credential information, passed from the session to the SSL implementation",
-				     G_TYPE_TLS,
+				     G_TYPE_TLS_CONTEXT,
 				     G_PARAM_READWRITE));
 	/**
 	 * SOUP_SOCKET_SSL_STRICT:
@@ -425,7 +425,7 @@ set_fdflags (SoupSocketPrivate *priv)
 	if (!priv->gsock)
 		priv->gsock = g_socket_new_from_fd (priv->sockfd, NULL);
 	g_socket_set_blocking (priv->gsock, !priv->non_blocking);
-	g_socket_set_io_timeout (priv->gsock, priv->timeout);
+	g_socket_set_timeout (priv->gsock, priv->timeout);
 }
 
 static void
@@ -447,9 +447,9 @@ set_property (GObject *object, guint prop_id,
 			g_socket_set_blocking (priv->gsock, !priv->non_blocking);
 		break;
 	case PROP_SSL_CREDENTIALS:
-		if (priv->tls)
-			g_object_unref (priv->tls);
-		priv->tls = g_value_dup_object (value);
+		if (priv->tls_context)
+			g_object_unref (priv->tls_context);
+		priv->tls_context = g_value_dup_object (value);
 		break;
 	case PROP_SSL_STRICT:
 		priv->ssl_strict = g_value_get_boolean (value);
@@ -465,7 +465,7 @@ set_property (GObject *object, guint prop_id,
 	case PROP_TIMEOUT:
 		priv->timeout = g_value_get_uint (value);
 		if (priv->gsock)
-			g_socket_set_io_timeout (priv->gsock, priv->timeout);
+			g_socket_set_timeout (priv->gsock, priv->timeout);
 		break;
 	case PROP_CLEAN_DISPOSE:
 		priv->clean_dispose = g_value_get_boolean (value);
@@ -496,7 +496,7 @@ get_property (GObject *object, guint prop_id,
 		g_value_set_boolean (value, priv->is_server);
 		break;
 	case PROP_SSL_CREDENTIALS:
-		g_value_set_object (value, priv->tls);
+		g_value_set_object (value, priv->tls_context);
 		break;
 	case PROP_SSL_STRICT:
 		g_value_set_boolean (value, priv->ssl_strict);
@@ -744,13 +744,13 @@ listen_watch (GSocket *gsock, GIOCondition condition, gpointer data)
 		new_priv->async_context = g_main_context_ref (priv->async_context);
 	new_priv->non_blocking = priv->non_blocking;
 	new_priv->is_server = TRUE;
-	if (priv->tls)
-		new_priv->tls = g_object_ref (priv->tls);
+	if (priv->tls_context)
+		new_priv->tls_context = g_object_ref (priv->tls_context);
 	set_fdflags (new_priv);
 
 	new_priv->remote_addr = soup_address_new_from_sockaddr ((struct sockaddr *)&sa, sa_len);
 
-	if (new_priv->tls) {
+	if (new_priv->tls_context) {
 		if (!soup_socket_start_ssl (new, NULL)) {
 			g_object_unref (new);
 			return TRUE;
@@ -859,30 +859,35 @@ soup_socket_start_proxy_ssl (SoupSocket *sock, const char *ssl_host,
 			     GCancellable *cancellable)
 {
 	SoupSocketPrivate *priv = SOUP_SOCKET_GET_PRIVATE (sock);
-	GError *error = NULL;
 
 	if (priv->tls_session)
 		return TRUE;
-	if (!priv->tls)
+	if (!priv->tls_context)
 		return FALSE;
 
-	priv->tls_session = g_tls_create_session (priv->tls, priv->gsock,
-						  ssl_host, NULL);
+	if (G_IS_TLS_CLIENT_CONTEXT (priv->tls_context)) {
+		GTlsClient *client;
+
+		client = g_tls_client_context_create_client (G_TLS_CLIENT_CONTEXT (priv->tls_context),
+							     priv->gsock,
+							     ssl_host,
+							     NULL);
+		priv->tls_session = G_TLS_SESSION (client);
+	} else {
+		GTlsServer *server;
+		GTlsCertificate *default_cert;
+
+		default_cert = g_object_get_data (G_OBJECT (priv->tls_context),
+						  "soup_ssl_server_credentials");
+		server = g_tls_server_context_create_server (G_TLS_SERVER_CONTEXT (priv->tls_context),
+							     priv->gsock,
+							     default_cert,
+							     G_TLS_AUTHENTICATION_NONE,
+							     NULL);
+		priv->tls_session = G_TLS_SESSION (server);
+	}
 	if (!priv->tls_session)
 		return FALSE;
-
-	/* We need to start the handshake, but we don't actually need
-	 * to finish it; if it blocks, the next call to
-	 * g_tls_session_send/_recv will continue.
-	 */
-	if (!g_tls_session_handshake (priv->tls_session, cancellable, &error)) {
-		if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_WOULD_BLOCK)) {
-			g_error_free (error);
-			return TRUE;
-		}
-		g_error_free (error);
-		return FALSE;
-	}
 
 	return TRUE;
 }
@@ -902,7 +907,7 @@ soup_socket_is_ssl (SoupSocket *sock)
 {
 	SoupSocketPrivate *priv = SOUP_SOCKET_GET_PRIVATE (sock);
 
-	return priv->tls != NULL;
+	return priv->tls_context != NULL;
 }
 
 /**

@@ -19,22 +19,23 @@ const gboolean soup_ssl_supported = TRUE;
 SoupSSLCredentials *
 soup_ssl_get_client_credentials (const char *ca_file)
 {
-	GTlsClient *tls;
+	GTlsClientContext *tls_context;
 
-	tls = g_tls_client_new ();
+	tls_context = g_tls_client_context_new ();
 	if (ca_file) {
 		GError *error = NULL;
 
-		g_tls_client_set_ca_list_from_file (tls, ca_file, &error);
+		g_tls_context_set_ca_list_from_file (G_TLS_CONTEXT (tls_context),
+						     ca_file, &error);
 		if (error) {
 			g_warning ("Could not set SSL credentials from '%s': %s",
 				   ca_file, error->message);
 			g_error_free (error);
 		}
 	} else
-		g_tls_client_set_validation_flags (tls, 0);
+		g_tls_client_context_set_validation_flags (tls_context, 0);
 
-	return (SoupSSLCredentials *)tls;
+	return (SoupSSLCredentials *)tls_context;
 }
 
 void
@@ -46,14 +47,53 @@ soup_ssl_free_client_credentials (SoupSSLCredentials *client_creds)
 SoupSSLCredentials *
 soup_ssl_get_server_credentials (const char *cert_file, const char *key_file)
 {
-	/* Not yet implemented */
-	return NULL;
+	GTlsServerContext *tls_context;
+	GTlsCertificate *cert;
+	GError *error = NULL;
+	char *cert_pem, *key_pem;
+
+	if (!g_file_get_contents (cert_file, &cert_pem, NULL, &error)) {
+		g_warning ("Could not read SSL certificate from '%s': %s",
+			   cert_file, error->message);
+		g_error_free (error);
+		return NULL;
+	}
+	if (!g_file_get_contents (key_file, &key_pem, NULL, &error)) {
+		g_warning ("Could not read SSL private key from '%s': %s",
+			   key_file, error->message);
+		g_error_free (error);
+		g_free (cert_pem);
+		return NULL;
+	}
+
+	tls_context = g_tls_server_context_new ();
+	cert = g_initable_new (g_tls_context_get_certificate_type (G_TLS_CONTEXT (tls_context)),
+			       NULL, &error,
+			       "certificate-pem", cert_pem,
+			       "private-key-pem", key_pem,
+			       NULL);
+	g_free (cert_pem);
+	g_free (key_pem);
+
+	if (!cert) {
+		g_warning ("Could not create SSL certificate from '%s' and '%s': %s",
+			   cert_file, key_file, error->message);
+		g_error_free (error);
+		g_object_unref (tls_context);
+		return NULL;
+	}
+
+	g_object_set_data_full (G_OBJECT (tls_context),
+				"soup_ssl_server_credentials",
+				cert, g_object_unref);
+
+	return (SoupSSLCredentials *)tls_context;
 }
 
 void
 soup_ssl_free_server_credentials (SoupSSLCredentials *server_creds)
 {
-	;
+	g_object_unref (server_creds);
 }
 
 /**
