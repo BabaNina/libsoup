@@ -598,6 +598,7 @@ async_connected (GObject *client, GAsyncResult *result, gpointer data)
 	status = socket_connected (sacd->sock, conn, error);
 
 	sacd->callback (sacd->sock, status, sacd->user_data);
+	g_object_unref (sacd->sock);
 	g_slice_free (SoupSocketAsyncConnectData, sacd);
 }
 
@@ -629,7 +630,7 @@ soup_socket_connect_async (SoupSocket *sock, GCancellable *cancellable,
 	g_return_if_fail (priv->remote_addr != NULL);
 
 	sacd = g_slice_new0 (SoupSocketAsyncConnectData);
-	sacd->sock = sock;
+	sacd->sock = g_object_ref (sock);
 	sacd->callback = callback;
 	sacd->user_data = user_data;
 
@@ -826,6 +827,16 @@ soup_socket_listen (SoupSocket *sock)
 	return FALSE;
 }
 
+static gboolean
+soup_socket_accept_certificate (GTlsClient *client, GTlsCertificate *cert,
+				GTlsValidationFlags errors, gpointer sock)
+{
+	SoupSocketPrivate *priv = SOUP_SOCKET_GET_PRIVATE (sock);
+
+	priv->trusted_certificate = FALSE;
+	return !priv->ssl_strict;
+}
+
 /**
  * soup_socket_start_ssl:
  * @sock: the socket
@@ -872,6 +883,15 @@ soup_socket_start_proxy_ssl (SoupSocket *sock, const char *ssl_host,
 							     priv->gsock,
 							     ssl_host,
 							     NULL);
+
+		/* FIXME: need a signal to let us know a successful
+		 * handshake happened.
+		 */
+		priv->trusted_certificate = TRUE;
+
+		g_signal_connect (client, "accept-certificate",
+				  G_CALLBACK (soup_socket_accept_certificate),
+				  sock);
 		priv->tls_session = G_TLS_SESSION (client);
 	} else {
 		GTlsServer *server;
