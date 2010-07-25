@@ -44,8 +44,10 @@ typedef struct {
 
 	char *       (*get_authorization)    (SoupAuth      *auth,
 					      SoupMessage   *msg);
+
+	gboolean     (*is_ready)             (SoupAuth      *auth);
+
 	/* Padding for future expansion */
-	void (*_libsoup_reserved1) (void);
 	void (*_libsoup_reserved2) (void);
 	void (*_libsoup_reserved3) (void);
 	void (*_libsoup_reserved4) (void);
@@ -85,6 +87,7 @@ void        soup_auth_authenticate          (SoupAuth      *auth,
 					     const char    *username,
 					     const char    *password);
 gboolean    soup_auth_is_authenticated      (SoupAuth      *auth);
+gboolean    soup_auth_is_ready              (SoupAuth      *auth);
 
 char       *soup_auth_get_authorization     (SoupAuth      *auth, 
 					     SoupMessage   *msg);

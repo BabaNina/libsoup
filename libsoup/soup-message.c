@@ -1238,7 +1238,6 @@ soup_message_set_auth (SoupMessage *msg, SoupAuth *auth)
 
 	g_return_if_fail (SOUP_IS_MESSAGE (msg));
 	g_return_if_fail (auth == NULL || SOUP_IS_AUTH (auth));
-	g_return_if_fail (auth == NULL || soup_auth_is_authenticated (auth));
 
 	priv = SOUP_MESSAGE_GET_PRIVATE (msg);
 
@@ -1253,9 +1252,11 @@ soup_message_set_auth (SoupMessage *msg, SoupAuth *auth)
 
 	g_object_ref (priv->auth);
 	token = soup_auth_get_authorization (auth, msg);
-	soup_message_headers_replace (msg->request_headers,
-				      "Authorization", token);
-	g_free (token);
+	if (token) {
+		soup_message_headers_replace (msg->request_headers,
+					      "Authorization", token);
+		g_free (token);
+	}
 }
 
 /**

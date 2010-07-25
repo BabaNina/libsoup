@@ -120,12 +120,12 @@ libsoup_2_4_la_SOURCES =		\
 	soup-auth-domain-digest.c	\
 	soup-auth-manager.h		\
 	soup-auth-manager.c		\
-	soup-auth-manager-ntlm.h	\
-	soup-auth-manager-ntlm.c	\
 	soup-cache.c			\
 	soup-cache-private.h		\
 	soup-connection.h		\
 	soup-connection.c		\
+	soup-connection-auth.h		\
+	soup-connection-auth.c		\
 	soup-content-decoder.c		\
 	soup-content-sniffer.c		\
 	soup-cookie.c			\
