@@ -18,11 +18,11 @@
 #include "soup-misc.h"
 #include "soup-uri.h"
 
-static gboolean update (SoupAuth *auth, SoupMessage *msg, GHashTable *auth_params);
+static gboolean update_connection (SoupConnectionAuth *auth, SoupMessage *msg, const char *auth_header, SoupSocket *sock);
 static GSList *get_protection_space (SoupAuth *auth, SoupURI *source_uri);
 static void authenticate (SoupAuth *auth, const char *username, const char *password);
 static gboolean is_authenticated (SoupAuth *auth);
-static char *get_authorization (SoupAuth *auth, SoupMessage *msg);
+static char *get_connection_authorization (SoupConnectionAuth *auth, SoupMessage *msg, SoupSocket *sock);
 
 static void        soup_ntlm_lanmanager_hash   (const char  *password,
 						guchar       hash[21]);
@@ -48,22 +48,38 @@ typedef enum {
 } SoupNTLMState;
 
 typedef struct {
+	SoupSocket *sock;
+	guint signal_id;
 	SoupNTLMState state;
-	char *username;
-	guchar nt_hash[21], lm_hash[21];
 	char *nonce, *domain;
 	char *response_header;
+} SoupNTLMConnectionState;
+
+typedef struct {
+	char *username, *domain;
+	guchar nt_hash[21], lm_hash[21];
+	GHashTable *conns;
 } SoupAuthNTLMPrivate;
 #define SOUP_AUTH_NTLM_GET_PRIVATE(o) (G_TYPE_INSTANCE_GET_PRIVATE ((o), SOUP_TYPE_AUTH_NTLM, SoupAuthNTLMPrivate))
 
 G_DEFINE_TYPE (SoupAuthNTLM, soup_auth_ntlm, SOUP_TYPE_CONNECTION_AUTH)
 
 static void
+soup_ntlm_connection_state_free (SoupNTLMConnectionState *conn)
+{
+	g_signal_handler_disconnect (conn->sock, conn->signal_id);
+	g_free (conn->nonce);
+	g_free (conn->domain);
+	g_free (conn->response_header);
+	g_slice_free (SoupNTLMConnectionState, conn);
+}
+
+static void
 soup_auth_ntlm_init (SoupAuthNTLM *ntlm)
 {
 	SoupAuthNTLMPrivate *priv = SOUP_AUTH_NTLM_GET_PRIVATE (ntlm);
 
-	priv->state = SOUP_NTLM_NEW;
+	priv->conns = g_hash_table_new_full (NULL, NULL, NULL, (GDestroyNotify)soup_ntlm_connection_state_free);
 }
 
 static void
@@ -72,12 +88,10 @@ finalize (GObject *object)
 	SoupAuthNTLMPrivate *priv = SOUP_AUTH_NTLM_GET_PRIVATE (object);
 
 	g_free (priv->username);
+	g_free (priv->domain);
 	memset (priv->nt_hash, 0, sizeof (priv->nt_hash));
 	memset (priv->lm_hash, 0, sizeof (priv->lm_hash));
-
-	g_free (priv->nonce);
-	g_free (priv->domain);
-	g_free (priv->response_header);
+	g_hash_table_destroy (priv->conns);
 
 	G_OBJECT_CLASS (soup_auth_ntlm_parent_class)->finalize (object);
 }
@@ -86,6 +100,7 @@ static void
 soup_auth_ntlm_class_init (SoupAuthNTLMClass *auth_ntlm_class)
 {
 	SoupAuthClass *auth_class = SOUP_AUTH_CLASS (auth_ntlm_class);
+	SoupConnectionAuthClass *connauth_class = SOUP_CONNECTION_AUTH_CLASS (auth_ntlm_class);
 	GObjectClass *object_class = G_OBJECT_CLASS (auth_ntlm_class);
 
 	g_type_class_add_private (auth_ntlm_class, sizeof (SoupAuthNTLMPrivate));
@@ -93,56 +108,70 @@ soup_auth_ntlm_class_init (SoupAuthNTLMClass *auth_ntlm_class)
 	auth_class->scheme_name = "NTLM";
 	auth_class->strength = 3;
 
-	auth_class->update = update;
 	auth_class->get_protection_space = get_protection_space;
 	auth_class->authenticate = authenticate;
 	auth_class->is_authenticated = is_authenticated;
-	auth_class->get_authorization = get_authorization;
+
+	connauth_class->update_connection = update_connection;
+	connauth_class->get_connection_authorization = get_connection_authorization;
 
 	object_class->finalize = finalize;
 }
 
+static void
+socket_disconnected (SoupSocket *sock, gpointer user_data)
+{
+	SoupAuthNTLMPrivate *priv = user_data;
+
+	g_hash_table_remove (priv->conns, sock);
+}
+
+static SoupNTLMConnectionState *
+get_state_for_socket (SoupAuthNTLMPrivate *priv, SoupSocket *sock)
+{
+	SoupNTLMConnectionState *conn;
+
+	conn = g_hash_table_lookup (priv->conns, sock);
+	if (conn)
+		return conn;
+
+	conn = g_slice_new0 (SoupNTLMConnectionState);
+	conn->sock = sock;
+	conn->state = SOUP_NTLM_NEW;
+	g_hash_table_insert (priv->conns, sock, conn);
+	conn->signal_id = g_signal_connect (sock, "disconnected",
+					    G_CALLBACK (socket_disconnected), priv);
+	return conn;
+}
+
 static gboolean
-update (SoupAuth *auth, SoupMessage *msg, GHashTable *auth_params)
+update_connection (SoupConnectionAuth *auth, SoupMessage *msg,
+		   const char *header, SoupSocket *sock)
 {
 	SoupAuthNTLMPrivate *priv = SOUP_AUTH_NTLM_GET_PRIVATE (auth);
-	GHashTableIter iter;
-	gpointer key, value;
-	char *header;
+	SoupNTLMConnectionState *conn;
 
-	if (priv->state > SOUP_NTLM_SENT_REQUEST) {
+	conn = get_state_for_socket (priv, sock);
+
+	if (conn->state > SOUP_NTLM_SENT_REQUEST) {
 		/* We already authenticated, but then got another 401.
 		 * That means "permission denied", so don't try to
 		 * authenticate again.
 		 */
-		priv->state = SOUP_NTLM_FAILED;
+		conn->state = SOUP_NTLM_FAILED;
 		return FALSE;
 	}
 
-	/* The header will be something like "NTLM blahblahblah===",
-	 * which soup_auth_update() will parse as
-	 * "blahblahblah" = "==". Undo that.
-	 */
-	g_hash_table_iter_init (&iter, auth_params);
-	if (!g_hash_table_iter_next (&iter, &key, &value))
-		return FALSE;
-	if (value)
-		header = g_strdup_printf ("%s=%s", (char *)key, (char *)value);
-	else
-		header = g_strdup (key);
+	if (strcmp (header, "NTLM") == 0)
+		return TRUE;
 
-	if (!soup_ntlm_parse_challenge (header, &priv->nonce, &priv->domain)) {
-		g_free (header);
-		priv->state = SOUP_NTLM_FAILED;
+	if (soup_ntlm_parse_challenge (header + 5, &conn->nonce, &conn->domain))
+		conn->state = SOUP_NTLM_RECEIVED_CHALLENGE;
+        else {
+		conn->state = SOUP_NTLM_FAILED;
 		return FALSE;
 	}
-	g_free (header);
 
-	priv->state = SOUP_NTLM_RECEIVED_CHALLENGE;
-	g_object_set (G_OBJECT (auth),
-		      SOUP_AUTH_REALM, priv->domain,
-		      SOUP_AUTH_HOST, soup_message_get_uri (msg)->host,
-		      NULL);
 	return TRUE;
 }
 
@@ -160,7 +189,6 @@ authenticate (SoupAuth *auth, const char *username, const char *password)
 
 	g_return_if_fail (username != NULL);
 	g_return_if_fail (password != NULL);
-	g_return_if_fail (priv->nonce != NULL);
 
 	slash = strpbrk (username, "\\/");
 	if (slash) {
@@ -173,41 +201,56 @@ authenticate (SoupAuth *auth, const char *username, const char *password)
 
 	soup_ntlm_nt_hash (password, priv->nt_hash);
 	soup_ntlm_lanmanager_hash (password, priv->lm_hash);
-
-	priv->response_header = soup_ntlm_response (priv->nonce,
-						    priv->username,
-						    priv->nt_hash,
-						    priv->lm_hash,
-						    NULL,
-						    priv->domain);
-
-	g_free (priv->nonce);
-	priv->nonce = NULL;
 }
 
 static gboolean
 is_authenticated (SoupAuth *auth)
 {
-	return SOUP_AUTH_NTLM_GET_PRIVATE (auth)->username != NULL &&
-		SOUP_AUTH_NTLM_GET_PRIVATE (auth)->response_header != NULL;
+	return SOUP_AUTH_NTLM_GET_PRIVATE (auth)->username != NULL;
+}
+
+static gboolean
+compute_connection_response (SoupAuthNTLMPrivate     *priv,
+			     SoupNTLMConnectionState *conn)
+{
+	if (!priv->username || !conn->nonce)
+		return FALSE;
+
+	conn->response_header = soup_ntlm_response (conn->nonce,
+						    priv->username,
+						    priv->nt_hash,
+						    priv->lm_hash,
+						    NULL,
+						    priv->domain ? priv->domain : conn->domain);
+
+	g_free (conn->nonce);
+	conn->nonce = NULL;
+
+	return TRUE;
 }
 
 static char *
-get_authorization (SoupAuth *auth, SoupMessage *msg)
+get_connection_authorization (SoupConnectionAuth *auth,
+			      SoupMessage *msg, SoupSocket *sock)
 {
 	SoupAuthNTLMPrivate *priv =
 		SOUP_AUTH_NTLM_GET_PRIVATE (auth);
+	SoupNTLMConnectionState *conn;
 	char *header = NULL;
 
-	switch (priv->state) {
+	conn = get_state_for_socket (priv, sock);
+	switch (conn->state) {
 	case SOUP_NTLM_NEW:
 		header = soup_ntlm_request ();
-		priv->state = SOUP_NTLM_SENT_REQUEST;
+		conn->state = SOUP_NTLM_SENT_REQUEST;
 		break;
 	case SOUP_NTLM_RECEIVED_CHALLENGE:
-		header = priv->response_header;
-		priv->response_header = NULL;
-		priv->state = SOUP_NTLM_SENT_RESPONSE;
+		if (!compute_connection_response (priv, conn))
+			g_return_val_if_reached (NULL);
+
+		header = conn->response_header;
+		conn->response_header = NULL;
+		conn->state = SOUP_NTLM_SENT_RESPONSE;
 		break;
 	default:
 		break;

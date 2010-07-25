@@ -25,6 +25,13 @@ typedef struct {
 typedef struct {
 	SoupAuthClass parent_class;
 
+	gboolean  (*update_connection)            (SoupConnectionAuth *auth,
+						   SoupMessage        *msg,
+						   const char         *auth_header,
+						   SoupSocket         *sock);
+	char     *(*get_connection_authorization) (SoupConnectionAuth *auth,
+						   SoupMessage        *msg,
+						   SoupSocket         *sock);
 } SoupConnectionAuthClass;
 
 GType soup_connection_auth_get_type (void);
