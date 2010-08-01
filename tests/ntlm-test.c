@@ -348,31 +348,31 @@ do_ntlm_round (SoupURI *base_uri, gboolean use_ntlm, const char *user)
 	}
 
 	do_message (session, base_uri, "/noauth",
-		    FALSE, use_ntlm,
+		    FALSE, FALSE,
 		    FALSE, FALSE,
 		    SOUP_STATUS_OK);
 	do_message (session, base_uri, "/alice",
-		    !use_ntlm || bob, FALSE,
+		    TRUE, use_ntlm,
 		    FALSE, FALSE,
 		    alice ? SOUP_STATUS_OK :
 		    SOUP_STATUS_UNAUTHORIZED);
 	do_message (session, base_uri, "/alice/404",
-		    !use_ntlm, bob,
+		    TRUE, bob,
 		    FALSE, FALSE,
 		    alice ? SOUP_STATUS_NOT_FOUND :
 		    SOUP_STATUS_UNAUTHORIZED);
 	do_message (session, base_uri, "/alice",
-		    !use_ntlm, bob,
+		    TRUE, bob,
 		    FALSE, FALSE,
 		    alice ? SOUP_STATUS_OK :
 		    SOUP_STATUS_UNAUTHORIZED);
 	do_message (session, base_uri, "/bob",
-		    !use_ntlm || alice, bob,
+		    TRUE, bob,
 		    FALSE, FALSE,
 		    bob ? SOUP_STATUS_OK :
 		    SOUP_STATUS_UNAUTHORIZED);
 	do_message (session, base_uri, "/alice",
-		    !use_ntlm || bob, alice,
+		    TRUE, alice,
 		    FALSE, FALSE,
 		    alice ? SOUP_STATUS_OK :
 		    SOUP_STATUS_UNAUTHORIZED);
@@ -382,7 +382,7 @@ do_ntlm_round (SoupURI *base_uri, gboolean use_ntlm, const char *user)
 		    user != NULL ? SOUP_STATUS_OK :
 		    SOUP_STATUS_UNAUTHORIZED);
 	do_message (session, base_uri, "/either",
-		    !use_ntlm, FALSE,
+		    TRUE, FALSE,
 		    !use_ntlm, !use_ntlm && user != NULL,
 		    user != NULL ? SOUP_STATUS_OK :
 		    SOUP_STATUS_UNAUTHORIZED);
