@@ -335,7 +335,7 @@ soup_auth_update (SoupAuth *auth, SoupMessage *msg, const char *auth_header)
 
 	params = soup_header_parse_param_list (auth_header + strlen (scheme));
 	if (!params)
-		return FALSE;
+		params = g_hash_table_new (NULL, NULL);
 
 	realm = g_hash_table_lookup (params, "realm");
 	if (realm && auth->realm && strcmp (realm, auth->realm) != 0) {
