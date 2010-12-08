@@ -21,6 +21,7 @@
 #include "soup-marshal.h"
 #include "soup-misc.h"
 #include "soup-misc-private.h"
+#include "soup-output-stream.h"
 
 /**
  * SECTION:soup-socket
@@ -127,6 +128,7 @@ disconnect_internal (SoupSocket *sock)
 		g_object_unref (priv->conn);
 		priv->conn = NULL;
 		priv->istream = NULL;
+		g_object_unref (priv->ostream);
 		priv->ostream = NULL;
 	}
 
@@ -474,7 +476,7 @@ finish_socket_setup (SoupSocketPrivate *priv)
 	if (!priv->istream)
 		priv->istream = G_POLLABLE_INPUT_STREAM (g_io_stream_get_input_stream (priv->conn));
 	if (!priv->ostream)
-		priv->ostream = G_POLLABLE_OUTPUT_STREAM (g_io_stream_get_output_stream (priv->conn));
+		priv->ostream = G_POLLABLE_OUTPUT_STREAM (soup_output_stream_new (g_io_stream_get_output_stream (priv->conn), !priv->non_blocking));
 
 	g_socket_set_timeout (priv->gsock, priv->timeout);
 }
@@ -985,7 +987,7 @@ soup_socket_start_proxy_ssl (SoupSocket *sock, const char *ssl_host,
 			  G_CALLBACK (soup_socket_peer_certificate_changed), sock);
 
 	priv->istream = G_POLLABLE_INPUT_STREAM (g_io_stream_get_input_stream (priv->conn));
-	priv->ostream = G_POLLABLE_OUTPUT_STREAM (g_io_stream_get_output_stream (priv->conn));
+	priv->ostream = G_POLLABLE_OUTPUT_STREAM (soup_output_stream_new (g_io_stream_get_output_stream (priv->conn), !priv->non_blocking));
 	return TRUE;
 }
 	
@@ -1213,6 +1215,14 @@ soup_socket_get_remote_address (SoupSocket *sock)
 	g_mutex_unlock (priv->addrlock);
 
 	return priv->remote_addr;
+}
+
+GOutputStream *
+soup_socket_get_output_stream (SoupSocket *sock)
+{
+	g_return_val_if_fail (SOUP_IS_SOCKET (sock), NULL);
+
+	return G_OUTPUT_STREAM (SOUP_SOCKET_GET_PRIVATE (sock)->ostream);
 }
 
 
