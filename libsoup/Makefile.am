@@ -143,6 +143,8 @@ libsoup_2_4_la_SOURCES =		\
 	soup-headers.c			\
 	soup-http-input-stream.h	\
 	soup-http-input-stream.c	\
+	soup-input-stream.h		\
+	soup-input-stream.c		\
 	soup-logger.c			\
 	soup-message.c			\
 	soup-message-body.c		\

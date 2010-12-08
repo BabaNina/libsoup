@@ -14,6 +14,7 @@
 
 #include "soup-coding.h"
 #include "soup-connection.h"
+#include "soup-input-stream.h"
 #include "soup-message.h"
 #include "soup-message-private.h"
 #include "soup-message-queue.h"
@@ -73,8 +74,8 @@ typedef struct {
 	goffset               write_length;
 	goffset               written;
 
-	guint read_tag, err_tag, tls_signal_id;
-	GSource *write_source;
+	guint err_tag, tls_signal_id;
+	GSource *read_source, *write_source;
 	GSource *unpause_source;
 	gboolean paused;
 
@@ -113,6 +114,8 @@ soup_message_io_cleanup (SoupMessage *msg)
 		g_signal_handler_disconnect (io->sock, io->tls_signal_id);
 	if (io->sock)
 		g_object_unref (io->sock);
+	if (io->istream)
+		g_object_unref (io->istream);
 	if (io->async_context)
 		g_main_context_unref (io->async_context);
 	if (io->item)
@@ -139,9 +142,9 @@ soup_message_io_stop (SoupMessage *msg)
 	if (!io)
 		return;
 
-	if (io->read_tag) {
-		g_signal_handler_disconnect (io->sock, io->read_tag);
-		io->read_tag = 0;
+	if (io->read_source) {
+		g_source_destroy (io->read_source);
+		io->read_source = NULL;
 	}
 	if (io->write_source) {
 		g_source_destroy (io->write_source);
@@ -235,6 +238,19 @@ io_disconnected (SoupSocket *sock, SoupMessage *msg)
 }
 
 static gboolean
+io_readable (GPollableInputStream *stream, gpointer msg)
+{
+	SoupMessagePrivate *priv = SOUP_MESSAGE_GET_PRIVATE (msg);
+	SoupMessageIOData *io = priv->io_data;
+
+	g_source_destroy (io->read_source);
+	io->read_source = NULL;
+
+	io_read (io->sock, msg);
+	return FALSE;
+}
+
+static gboolean
 io_handle_sniffing (SoupMessage *msg, gboolean done_reading)
 {
 	SoupMessagePrivate *priv = SOUP_MESSAGE_GET_PRIVATE (msg);
@@ -305,23 +321,44 @@ read_metadata (SoupMessage *msg, gboolean to_blank)
 {
 	SoupMessagePrivate *priv = SOUP_MESSAGE_GET_PRIVATE (msg);
 	SoupMessageIOData *io = priv->io_data;
-	SoupSocketIOStatus status;
 	guchar read_buf[RESPONSE_BLOCK_SIZE];
-	gsize nread;
+	gssize nread;
 	gboolean got_lf;
 	GError *error = NULL;
 
-	while (1) {
-		status = soup_socket_read_until (io->sock, read_buf,
-						 sizeof (read_buf),
-						 "\n", 1, &nread, &got_lf,
-						 NULL, &error);
-		switch (status) {
-		case SOUP_SOCKET_OK:
-			g_byte_array_append (io->read_meta_buf, read_buf, nread);
-			break;
+	if (!io->istream) {
+		io_error (io->sock, msg, NULL);
+		return FALSE;
+	}
 
-		case SOUP_SOCKET_EOF:
+	while (1) {
+		if (io->non_blocking) {
+			nread = soup_input_stream_read_line_nonblocking (
+				SOUP_INPUT_STREAM (io->istream),
+				read_buf, sizeof (read_buf),
+				NULL, &error);
+		} else {
+			nread = soup_input_stream_read_line (
+				SOUP_INPUT_STREAM (io->istream),
+				read_buf, sizeof (read_buf),
+				NULL, &error);
+		}
+
+		if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_WOULD_BLOCK)) {
+			g_error_free (error);
+			io->read_source = g_pollable_input_stream_create_source (
+				G_POLLABLE_INPUT_STREAM (io->istream),
+				NULL);
+			g_source_set_callback (io->read_source, (GSourceFunc) io_readable, msg, NULL);
+			g_source_attach (io->read_source, io->async_context);
+			g_source_unref (io->read_source);
+			return FALSE;
+		}
+
+		if (nread > 0) {
+			g_byte_array_append (io->read_meta_buf, read_buf, nread);
+			got_lf = memchr (read_buf, '\n', nread) != NULL;
+		} else if (nread == 0) {
 			/* More lame server handling... deal with
 			 * servers that don't send the final chunk.
 			 */
@@ -330,21 +367,17 @@ read_metadata (SoupMessage *msg, gboolean to_blank)
 				g_byte_array_append (io->read_meta_buf,
 						     (guchar *)"0\r\n", 3);
 				got_lf = TRUE;
-				break;
 			} else if (io->read_state == SOUP_MESSAGE_IO_STATE_TRAILERS &&
 				   io->read_meta_buf->len == 0) {
 				g_byte_array_append (io->read_meta_buf,
 						     (guchar *)"\r\n", 2);
 				got_lf = TRUE;
-				break;
+			} else {
+				io_error (io->sock, msg, NULL);
+				return FALSE;
 			}
-			/* else fall through */
-
-		case SOUP_SOCKET_ERROR:
+		} else {
 			io_error (io->sock, msg, error);
-			return FALSE;
-
-		case SOUP_SOCKET_WOULD_BLOCK:
 			return FALSE;
 		}
 
@@ -414,13 +447,17 @@ read_body_chunk (SoupMessage *msg)
 {
 	SoupMessagePrivate *priv = SOUP_MESSAGE_GET_PRIVATE (msg);
 	SoupMessageIOData *io = priv->io_data;
-	SoupSocketIOStatus status;
 	guchar *stack_buf = NULL;
 	gsize len;
 	gboolean read_to_eof = (io->read_encoding == SOUP_ENCODING_EOF);
-	gsize nread;
+	gssize nread;
 	GError *error = NULL;
 	SoupBuffer *buffer;
+
+	if (!io->istream) {
+		io_error (io->sock, msg, NULL);
+		return FALSE;
+	}
 
 	if (!io_handle_sniffing (msg, FALSE))
 		return FALSE;
@@ -445,11 +482,18 @@ read_body_chunk (SoupMessage *msg)
 		else
 			len = MIN (buffer->length, io->read_length);
 
-		status = soup_socket_read (io->sock,
-					   (guchar *)buffer->data, len,
-					   &nread, NULL, &error);
+		if (io->non_blocking) {
+			nread = g_pollable_input_stream_read_nonblocking (
+				G_POLLABLE_INPUT_STREAM (io->istream),
+				(guchar *)buffer->data, len,
+				NULL, &error);
+		} else {
+			nread = g_input_stream_read (io->istream,
+						     (guchar *)buffer->data, len,
+						     NULL, &error);
+		}
 
-		if (status == SOUP_SOCKET_OK && nread) {
+		if (nread > 0) {
 			buffer->length = nread;
 			io->read_length -= nread;
 
@@ -476,24 +520,28 @@ read_body_chunk (SoupMessage *msg)
 		}
 
 		soup_buffer_free (buffer);
-		switch (status) {
-		case SOUP_SOCKET_OK:
-			break;
 
-		case SOUP_SOCKET_EOF:
+		if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_WOULD_BLOCK)) {
+			g_error_free (error);
+			io->read_source = g_pollable_input_stream_create_source (
+				G_POLLABLE_INPUT_STREAM (io->istream),
+				NULL);
+			g_source_set_callback (io->read_source, (GSourceFunc) io_readable, msg, NULL);
+			g_source_attach (io->read_source, io->async_context);
+			g_source_unref (io->read_source);
+			return FALSE;
+		}
+
+		if (nread == 0) {
 			if (io->read_eof_ok) {
 				io->read_length = 0;
 				return TRUE;
 			}
-			/* else fall through */
-
-		case SOUP_SOCKET_ERROR:
-			io_error (io->sock, msg, error);
-			return FALSE;
-
-		case SOUP_SOCKET_WOULD_BLOCK:
-			return FALSE;
+			/* else... */
 		}
+
+		io_error (io->sock, msg, error);
+		return FALSE;
 	}
 
 	return TRUE;
@@ -1037,9 +1085,9 @@ io_read (SoupSocket *sock, SoupMessage *msg)
 
 
 	case SOUP_MESSAGE_IO_STATE_FINISHING:
-		if (io->read_tag) {
-			g_signal_handler_disconnect (io->sock, io->read_tag);
-			io->read_tag = 0;
+		if (io->read_source) {
+			g_source_destroy (io->read_source);
+			io->read_source = NULL;
 		}
 		io->read_state = SOUP_MESSAGE_IO_STATE_DONE;
 
@@ -1101,7 +1149,7 @@ new_iostate (SoupMessage *msg, SoupSocket *sock, SoupMessageIOMode mode,
 	io->sock = g_object_ref (sock);
 	iostream = soup_socket_get_iostream (sock);
 	if (iostream) {
-		io->istream = g_io_stream_get_input_stream (iostream);
+		io->istream = soup_input_stream_new (g_io_stream_get_input_stream (iostream));
 		io->ostream = g_io_stream_get_output_stream (iostream);
 	}
 	g_object_get (io->sock,
@@ -1112,8 +1160,6 @@ new_iostate (SoupMessage *msg, SoupSocket *sock, SoupMessageIOMode mode,
 	io->read_meta_buf    = g_byte_array_new ();
 	io->write_buf        = g_string_new (NULL);
 
-	io->read_tag  = g_signal_connect (io->sock, "readable",
-					  G_CALLBACK (io_read), msg);
 	io->err_tag   = g_signal_connect (io->sock, "disconnected",
 					  G_CALLBACK (io_disconnected), msg);
 
@@ -1189,9 +1235,9 @@ soup_message_io_pause (SoupMessage *msg)
 		g_source_destroy (io->write_source);
 		io->write_source = NULL;
 	}
-	if (io->read_tag) {
-		g_signal_handler_disconnect (io->sock, io->read_tag);
-		io->read_tag = 0;
+	if (io->read_source) {
+		g_source_destroy (io->read_source);
+		io->read_source = NULL;
 	}
 
 	if (io->unpause_source) {
@@ -1212,13 +1258,8 @@ io_unpause_internal (gpointer msg)
 	io->unpause_source = NULL;
 	io->paused = FALSE;
 
-	if (io->write_source || io->read_tag)
+	if (io->write_source || io->read_source)
 		return FALSE;
-
-	if (io->read_state != SOUP_MESSAGE_IO_STATE_DONE) {
-		io->read_tag = g_signal_connect (io->sock, "readable",
-						 G_CALLBACK (io_read), msg);
-	}
 
 	if (SOUP_MESSAGE_IO_STATE_ACTIVE (io->write_state))
 		io_write (io->sock, msg);
