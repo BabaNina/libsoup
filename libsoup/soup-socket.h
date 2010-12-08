@@ -83,6 +83,7 @@ gboolean       soup_socket_is_connected       (SoupSocket         *sock);
 SoupAddress   *soup_socket_get_local_address  (SoupSocket         *sock);
 SoupAddress   *soup_socket_get_remote_address (SoupSocket         *sock);
 
+GIOStream     *soup_socket_get_iostream       (SoupSocket         *sock);
 
 typedef enum {
 	SOUP_SOCKET_OK,

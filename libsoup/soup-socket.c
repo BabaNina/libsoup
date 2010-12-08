@@ -1128,6 +1128,14 @@ soup_socket_get_remote_address (SoupSocket *sock)
 	return priv->remote_addr;
 }
 
+GIOStream *
+soup_socket_get_iostream (SoupSocket *sock)
+{
+	g_return_val_if_fail (SOUP_IS_SOCKET (sock), NULL);
+
+	return SOUP_SOCKET_GET_PRIVATE (sock)->conn;
+}
+
 
 static gboolean
 socket_read_watch (GObject *pollable, gpointer user_data)

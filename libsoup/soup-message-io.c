@@ -45,9 +45,14 @@ typedef enum {
 	 state != SOUP_MESSAGE_IO_STATE_DONE)
 
 typedef struct {
-	SoupSocket           *sock;
 	SoupMessageQueueItem *item;
 	SoupMessageIOMode     mode;
+
+	SoupSocket           *sock;
+	GInputStream         *istream;
+	GOutputStream        *ostream;
+	GMainContext         *async_context;
+	gboolean              non_blocking;
 
 	SoupMessageIOState    read_state;
 	SoupEncoding          read_encoding;
@@ -68,8 +73,10 @@ typedef struct {
 	goffset               write_length;
 	goffset               written;
 
-	guint read_tag, write_tag, err_tag, tls_signal_id;
+	guint read_tag, err_tag, tls_signal_id;
+	GSource *write_source;
 	GSource *unpause_source;
+	gboolean paused;
 
 	SoupMessageGetHeadersFn   get_headers_cb;
 	SoupMessageParseHeadersFn parse_headers_cb;
@@ -84,8 +91,8 @@ typedef struct {
  */
 #define dummy_to_make_emacs_happy {
 #define SOUP_MESSAGE_IO_PREPARE_FOR_CALLBACK { gboolean cancelled; g_object_ref (msg);
-#define SOUP_MESSAGE_IO_RETURN_IF_CANCELLED_OR_PAUSED cancelled = (priv->io_data != io); g_object_unref (msg); if (cancelled || (!io->read_tag && !io->write_tag)) return; }
-#define SOUP_MESSAGE_IO_RETURN_VAL_IF_CANCELLED_OR_PAUSED(val) cancelled = (priv->io_data != io); g_object_unref (msg); if (cancelled || (!io->read_tag && !io->write_tag)) return val; }
+#define SOUP_MESSAGE_IO_RETURN_IF_CANCELLED_OR_PAUSED cancelled = (priv->io_data != io); g_object_unref (msg); if (cancelled || io->paused) return; }
+#define SOUP_MESSAGE_IO_RETURN_VAL_IF_CANCELLED_OR_PAUSED(val) cancelled = (priv->io_data != io); g_object_unref (msg); if (cancelled || io->paused) return val; }
 
 #define RESPONSE_BLOCK_SIZE 8192
 
@@ -106,6 +113,8 @@ soup_message_io_cleanup (SoupMessage *msg)
 		g_signal_handler_disconnect (io->sock, io->tls_signal_id);
 	if (io->sock)
 		g_object_unref (io->sock);
+	if (io->async_context)
+		g_main_context_unref (io->async_context);
 	if (io->item)
 		soup_message_queue_item_unref (io->item);
 
@@ -134,9 +143,9 @@ soup_message_io_stop (SoupMessage *msg)
 		g_signal_handler_disconnect (io->sock, io->read_tag);
 		io->read_tag = 0;
 	}
-	if (io->write_tag) {
-		g_signal_handler_disconnect (io->sock, io->write_tag);
-		io->write_tag = 0;
+	if (io->write_source) {
+		g_source_destroy (io->write_source);
+		io->write_source = NULL;
 	}
 	if (io->err_tag) {
 		g_signal_handler_disconnect (io->sock, io->err_tag);
@@ -173,6 +182,7 @@ soup_message_io_finished (SoupMessage *msg)
 }
 
 static void io_read (SoupSocket *sock, SoupMessage *msg);
+static void io_write (SoupSocket *sock, SoupMessage *msg);
 
 static gboolean
 request_is_idempotent (SoupMessage *msg)
@@ -489,6 +499,19 @@ read_body_chunk (SoupMessage *msg)
 	return TRUE;
 }
 
+static gboolean
+io_writable (GPollableOutputStream *stream, gpointer msg)
+{
+	SoupMessagePrivate *priv = SOUP_MESSAGE_GET_PRIVATE (msg);
+	SoupMessageIOData *io = priv->io_data;
+
+	g_source_destroy (io->write_source);
+	io->write_source = NULL;
+
+	io_write (io->sock, msg);
+	return FALSE;
+}
+
 /* Attempts to write @len bytes from @data. See the note at
  * read_metadata() for an explanation of the return value.
  */
@@ -497,42 +520,56 @@ write_data (SoupMessage *msg, const char *data, guint len, gboolean body)
 {
 	SoupMessagePrivate *priv = SOUP_MESSAGE_GET_PRIVATE (msg);
 	SoupMessageIOData *io = priv->io_data;
-	SoupSocketIOStatus status;
 	gsize nwrote;
 	GError *error = NULL;
 	SoupBuffer *chunk;
 	const char *start;
 
+	if (!io->ostream) {
+		io_error (io->sock, msg, NULL);
+		return FALSE;
+	}
+
 	while (len > io->written) {
-		status = soup_socket_write (io->sock,
-					    data + io->written,
-					    len - io->written,
-					    &nwrote, NULL, &error);
-		switch (status) {
-		case SOUP_SOCKET_EOF:
-		case SOUP_SOCKET_ERROR:
+		if (io->non_blocking) {
+			nwrote = g_pollable_output_stream_write_nonblocking (
+				G_POLLABLE_OUTPUT_STREAM (io->ostream),
+				data + io->written, len - io->written,
+				NULL, &error);
+		} else {
+			nwrote = g_output_stream_write (io->ostream,
+							data + io->written,
+							len - io->written,
+							NULL, &error);
+		}
+
+		if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_WOULD_BLOCK)) {
+			g_error_free (error);
+			io->write_source = g_pollable_output_stream_create_source (
+				G_POLLABLE_OUTPUT_STREAM (io->ostream),
+				NULL);
+			g_source_set_callback (io->write_source, (GSourceFunc) io_writable, msg, NULL);
+			g_source_attach (io->write_source, io->async_context);
+			g_source_unref (io->write_source);
+			return FALSE;
+		} else if (error) {
 			io_error (io->sock, msg, error);
 			return FALSE;
+		}
 
-		case SOUP_SOCKET_WOULD_BLOCK:
-			return FALSE;
+		start = data + io->written;
+		io->written += nwrote;
 
-		case SOUP_SOCKET_OK:
-			start = data + io->written;
-			io->written += nwrote;
+		if (body) {
+			if (io->write_length)
+				io->write_length -= nwrote;
 
-			if (body) {
-				if (io->write_length)
-					io->write_length -= nwrote;
-
-				chunk = soup_buffer_new (SOUP_MEMORY_TEMPORARY,
-							 start, nwrote);
-				SOUP_MESSAGE_IO_PREPARE_FOR_CALLBACK;
-				soup_message_wrote_body_data (msg, chunk);
-				soup_buffer_free (chunk);
-				SOUP_MESSAGE_IO_RETURN_VAL_IF_CANCELLED_OR_PAUSED (FALSE);
-			}
-			break;
+			chunk = soup_buffer_new (SOUP_MEMORY_TEMPORARY,
+						 start, nwrote);
+			SOUP_MESSAGE_IO_PREPARE_FOR_CALLBACK;
+			soup_message_wrote_body_data (msg, chunk);
+			soup_buffer_free (chunk);
+			SOUP_MESSAGE_IO_RETURN_VAL_IF_CANCELLED_OR_PAUSED (FALSE);
 		}
 	}
 
@@ -783,9 +820,9 @@ io_write (SoupSocket *sock, SoupMessage *msg)
 
 
 	case SOUP_MESSAGE_IO_STATE_FINISHING:
-		if (io->write_tag) {
-			g_signal_handler_disconnect (io->sock, io->write_tag);
-			io->write_tag = 0;
+		if (io->write_source) {
+			g_source_destroy (io->write_source);
+			io->write_source = NULL;
 		}
 		io->write_state = SOUP_MESSAGE_IO_STATE_DONE;
 
@@ -1051,9 +1088,9 @@ new_iostate (SoupMessage *msg, SoupSocket *sock, SoupMessageIOMode mode,
 {
 	SoupMessagePrivate *priv = SOUP_MESSAGE_GET_PRIVATE (msg);
 	SoupMessageIOData *io;
+	GIOStream *iostream;
 
 	io = g_slice_new0 (SoupMessageIOData);
-	io->sock = g_object_ref (sock);
 	io->mode = mode;
 	io->get_headers_cb   = get_headers_cb;
 	io->parse_headers_cb = parse_headers_cb;
@@ -1061,13 +1098,22 @@ new_iostate (SoupMessage *msg, SoupSocket *sock, SoupMessageIOMode mode,
 	io->completion_cb    = completion_cb;
 	io->completion_data  = completion_data;
 
+	io->sock = g_object_ref (sock);
+	iostream = soup_socket_get_iostream (sock);
+	if (iostream) {
+		io->istream = g_io_stream_get_input_stream (iostream);
+		io->ostream = g_io_stream_get_output_stream (iostream);
+	}
+	g_object_get (io->sock,
+		      SOUP_SOCKET_FLAG_NONBLOCKING, &io->non_blocking,
+		      SOUP_SOCKET_ASYNC_CONTEXT, &io->async_context,
+		      NULL);
+
 	io->read_meta_buf    = g_byte_array_new ();
 	io->write_buf        = g_string_new (NULL);
 
 	io->read_tag  = g_signal_connect (io->sock, "readable",
 					  G_CALLBACK (io_read), msg);
-	io->write_tag = g_signal_connect (io->sock, "writable",
-					  G_CALLBACK (io_write), msg);
 	io->err_tag   = g_signal_connect (io->sock, "disconnected",
 					  G_CALLBACK (io_disconnected), msg);
 
@@ -1139,9 +1185,9 @@ soup_message_io_pause (SoupMessage *msg)
 
 	g_return_if_fail (io != NULL);
 
-	if (io->write_tag) {
-		g_signal_handler_disconnect (io->sock, io->write_tag);
-		io->write_tag = 0;
+	if (io->write_source) {
+		g_source_destroy (io->write_source);
+		io->write_source = NULL;
 	}
 	if (io->read_tag) {
 		g_signal_handler_disconnect (io->sock, io->read_tag);
@@ -1152,6 +1198,8 @@ soup_message_io_pause (SoupMessage *msg)
 		g_source_destroy (io->unpause_source);
 		io->unpause_source = NULL;
 	}
+
+	io->paused = TRUE;
 }
 
 static gboolean
@@ -1162,14 +1210,10 @@ io_unpause_internal (gpointer msg)
 
 	g_return_val_if_fail (io != NULL, FALSE);
 	io->unpause_source = NULL;
+	io->paused = FALSE;
 
-	if (io->write_tag || io->read_tag)
+	if (io->write_source || io->read_tag)
 		return FALSE;
-
-	if (io->write_state != SOUP_MESSAGE_IO_STATE_DONE) {
-		io->write_tag = g_signal_connect (io->sock, "writable",
-						  G_CALLBACK (io_write), msg);
-	}
 
 	if (io->read_state != SOUP_MESSAGE_IO_STATE_DONE) {
 		io->read_tag = g_signal_connect (io->sock, "readable",
