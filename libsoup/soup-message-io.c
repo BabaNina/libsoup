@@ -19,6 +19,7 @@
 #include "soup-message-private.h"
 #include "soup-message-queue.h"
 #include "soup-misc.h"
+#include "soup-output-stream.h"
 #include "soup-socket.h"
 #include "soup-ssl.h"
 
@@ -32,9 +33,6 @@ typedef enum {
 	SOUP_MESSAGE_IO_STATE_HEADERS,
 	SOUP_MESSAGE_IO_STATE_BLOCKING,
 	SOUP_MESSAGE_IO_STATE_BODY,
-	SOUP_MESSAGE_IO_STATE_CHUNK_SIZE,
-	SOUP_MESSAGE_IO_STATE_CHUNK,
-	SOUP_MESSAGE_IO_STATE_CHUNK_END,
 	SOUP_MESSAGE_IO_STATE_TRAILERS,
 	SOUP_MESSAGE_IO_STATE_FINISHING,
 	SOUP_MESSAGE_IO_STATE_DONE
@@ -51,7 +49,7 @@ typedef struct {
 
 	SoupSocket           *sock;
 	SoupInputStream      *istream;
-	GOutputStream        *ostream;
+	SoupOutputStream     *ostream;
 	GMainContext         *async_context;
 	gboolean              blocking;
 
@@ -185,7 +183,7 @@ soup_message_io_finished (SoupMessage *msg)
 }
 
 static gboolean io_read (SoupInputStream *stream, SoupMessage *msg);
-static gboolean io_write (GOutputStream *stream, SoupMessage *msg);
+static gboolean io_write (SoupOutputStream *stream, SoupMessage *msg);
 
 static gboolean
 request_is_idempotent (SoupMessage *msg)
@@ -526,7 +524,7 @@ write_data (SoupMessage *msg, const char *data, guint len, gboolean body)
 {
 	SoupMessagePrivate *priv = SOUP_MESSAGE_GET_PRIVATE (msg);
 	SoupMessageIOData *io = priv->io_data;
-	gsize nwrote;
+	gssize nwrote;
 	GError *error = NULL;
 	SoupBuffer *chunk;
 	const char *start;
@@ -536,18 +534,12 @@ write_data (SoupMessage *msg, const char *data, guint len, gboolean body)
 		return FALSE;
 	}
 
-	while (len > io->written) {
-		if (io->blocking) {
-			nwrote = g_output_stream_write (io->ostream,
-							data + io->written,
-							len - io->written,
-							NULL, &error);
-		} else {
-			nwrote = g_pollable_output_stream_write_nonblocking (
-				G_POLLABLE_OUTPUT_STREAM (io->ostream),
-				data + io->written, len - io->written,
-				NULL, &error);
-		}
+	do {
+		nwrote = soup_output_stream_write (io->ostream,
+						   data + io->written,
+						   len - io->written,
+						   io->blocking,
+						   NULL, &error);
 
 		if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_WOULD_BLOCK)) {
 			g_error_free (error);
@@ -573,19 +565,10 @@ write_data (SoupMessage *msg, const char *data, guint len, gboolean body)
 			soup_buffer_free (chunk);
 			SOUP_MESSAGE_IO_RETURN_VAL_IF_CANCELLED_OR_PAUSED (FALSE);
 		}
-	}
+	} while (len > io->written);
 
 	io->written = 0;
 	return TRUE;
-}
-
-static inline SoupMessageIOState
-io_body_state (SoupEncoding encoding)
-{
-	if (encoding == SOUP_ENCODING_CHUNKED)
-		return SOUP_MESSAGE_IO_STATE_CHUNK_SIZE;
-	else
-		return SOUP_MESSAGE_IO_STATE_BODY;
 }
 
 /*
@@ -615,7 +598,7 @@ io_body_state (SoupEncoding encoding)
  */
 
 static gboolean
-io_write (GOutputStream *stream, SoupMessage *msg)
+io_write (SoupOutputStream *stream, SoupMessage *msg)
 {
 	SoupMessagePrivate *priv = SOUP_MESSAGE_GET_PRIVATE (msg);
 	SoupMessageIOData *io = priv->io_data;
@@ -655,6 +638,9 @@ io_write (GOutputStream *stream, SoupMessage *msg)
 			io->write_length = soup_message_headers_get_content_length (hdrs);
 		}
 
+		soup_output_stream_set_encoding (io->ostream,
+						 io->write_encoding);
+
 		if (io->mode == SOUP_MESSAGE_IO_SERVER &&
 		    SOUP_STATUS_IS_INFORMATIONAL (msg->status_code)) {
 			if (msg->status_code == SOUP_STATUS_CONTINUE) {
@@ -677,7 +663,7 @@ io_write (GOutputStream *stream, SoupMessage *msg)
 			io->write_state = SOUP_MESSAGE_IO_STATE_BLOCKING;
 			io->read_state = SOUP_MESSAGE_IO_STATE_HEADERS;
 		} else {
-			io->write_state = io_body_state (io->write_encoding);
+			io->write_state = SOUP_MESSAGE_IO_STATE_BODY;
 
 			/* If the client was waiting for a Continue
 			 * but we sent something else, then they're
@@ -711,7 +697,9 @@ io_write (GOutputStream *stream, SoupMessage *msg)
 
 
 	case SOUP_MESSAGE_IO_STATE_BODY:
-		if (!io->write_length && io->write_encoding != SOUP_ENCODING_EOF) {
+		if (!io->write_length &&
+		    io->write_encoding != SOUP_ENCODING_EOF &&
+		    io->write_encoding != SOUP_ENCODING_CHUNKED) {
 		wrote_body:
 			io->write_state = SOUP_MESSAGE_IO_STATE_FINISHING;
 
@@ -727,8 +715,12 @@ io_write (GOutputStream *stream, SoupMessage *msg)
 				soup_message_io_pause (msg);
 				return FALSE;
 			}
-			if (io->write_chunk->length > io->write_length &&
-			    io->write_encoding != SOUP_ENCODING_EOF) {
+			if (io->write_encoding == SOUP_ENCODING_EOF) {
+				if (!io->write_chunk->length)
+					goto wrote_body;
+			} else if (io->write_encoding == SOUP_ENCODING_CHUNKED) {
+				io->write_length = io->write_chunk->length;
+			} else if (io->write_chunk->length > io->write_length) {
 				/* App is trying to write more than it
 				 * claimed it would; we have to truncate.
 				 */
@@ -737,14 +729,15 @@ io_write (GOutputStream *stream, SoupMessage *msg)
 								   0, io->write_length);
 				soup_buffer_free (io->write_chunk);
 				io->write_chunk = truncated;
-			} else if (io->write_encoding == SOUP_ENCODING_EOF &&
-				   !io->write_chunk->length)
-				goto wrote_body;
+			}
 		}
 
 		if (!write_data (msg, io->write_chunk->data,
 				 io->write_chunk->length, TRUE))
 			return FALSE;
+
+		if (io->write_chunk->length == 0)
+			goto wrote_body;
 
 		if (io->mode == SOUP_MESSAGE_IO_SERVER)
 			soup_message_body_wrote_chunk (io->write_body, io->write_chunk);
@@ -756,75 +749,6 @@ io_write (GOutputStream *stream, SoupMessage *msg)
 		soup_message_wrote_chunk (msg);
 		SOUP_MESSAGE_IO_RETURN_VAL_IF_CANCELLED_OR_PAUSED (FALSE);
 		break;
-
-	case SOUP_MESSAGE_IO_STATE_CHUNK_SIZE:
-		if (!io->write_chunk) {
-			io->write_chunk = soup_message_body_get_chunk (io->write_body, io->write_body_offset);
-			if (!io->write_chunk) {
-				soup_message_io_pause (msg);
-				return FALSE;
-			}
-			g_string_append_printf (io->write_buf, "%lx\r\n",
-						(unsigned long) io->write_chunk->length);
-			io->write_body_offset += io->write_chunk->length;
-		}
-
-		if (!write_data (msg, io->write_buf->str,
-				 io->write_buf->len, FALSE))
-			return FALSE;
-
-		g_string_truncate (io->write_buf, 0);
-
-		if (io->write_chunk->length == 0) {
-			/* The last chunk has no CHUNK_END... */
-			io->write_state = SOUP_MESSAGE_IO_STATE_TRAILERS;
-			break;
-		}
-
-		io->write_state = SOUP_MESSAGE_IO_STATE_CHUNK;
-		/* fall through */
-
-
-	case SOUP_MESSAGE_IO_STATE_CHUNK:
-		if (!write_data (msg, io->write_chunk->data,
-				 io->write_chunk->length, TRUE))
-			return FALSE;
-
-		if (io->mode == SOUP_MESSAGE_IO_SERVER)
-			soup_message_body_wrote_chunk (io->write_body, io->write_chunk);
-		soup_buffer_free (io->write_chunk);
-		io->write_chunk = NULL;
-
-		io->write_state = SOUP_MESSAGE_IO_STATE_CHUNK_END;
-
-		SOUP_MESSAGE_IO_PREPARE_FOR_CALLBACK;
-		soup_message_wrote_chunk (msg);
-		SOUP_MESSAGE_IO_RETURN_VAL_IF_CANCELLED_OR_PAUSED (FALSE);
-
-		/* fall through */
-
-
-	case SOUP_MESSAGE_IO_STATE_CHUNK_END:
-		if (!write_data (msg, SOUP_MESSAGE_IO_EOL,
-				 SOUP_MESSAGE_IO_EOL_LEN, FALSE))
-			return FALSE;
-
-		io->write_state = SOUP_MESSAGE_IO_STATE_CHUNK_SIZE;
-		break;
-
-
-	case SOUP_MESSAGE_IO_STATE_TRAILERS:
-		if (!write_data (msg, SOUP_MESSAGE_IO_EOL,
-				 SOUP_MESSAGE_IO_EOL_LEN, FALSE))
-			return FALSE;
-
-		io->write_state = SOUP_MESSAGE_IO_STATE_FINISHING;
-
-		SOUP_MESSAGE_IO_PREPARE_FOR_CALLBACK;
-		soup_message_wrote_body (msg);
-		SOUP_MESSAGE_IO_RETURN_VAL_IF_CANCELLED_OR_PAUSED (FALSE);
-		/* fall through */
-
 
 	case SOUP_MESSAGE_IO_STATE_FINISHING:
 		if (io->write_source) {
@@ -934,7 +858,7 @@ io_read (SoupInputStream *stream, SoupMessage *msg)
 				io->read_state =
 					SOUP_MESSAGE_IO_STATE_BLOCKING;
 				io->write_state =
-					io_body_state (io->write_encoding);
+					SOUP_MESSAGE_IO_STATE_BODY;
 			} else {
 				/* Just stay in HEADERS */
 				io->read_state = SOUP_MESSAGE_IO_STATE_HEADERS;
@@ -1075,7 +999,7 @@ new_iostate (SoupMessage *msg, SoupSocket *sock, SoupMessageIOMode mode,
 	iostream = soup_socket_get_iostream (sock);
 	if (iostream) {
 		io->istream = soup_input_stream_new (g_io_stream_get_input_stream (iostream));
-		io->ostream = g_io_stream_get_output_stream (iostream);
+		io->ostream = soup_output_stream_new (g_io_stream_get_output_stream (iostream));
 	}
 	g_object_get (io->sock,
 		      SOUP_SOCKET_FLAG_NONBLOCKING, &non_blocking,

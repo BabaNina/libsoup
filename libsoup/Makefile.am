@@ -158,6 +158,8 @@ libsoup_2_4_la_SOURCES =		\
 	soup-method.c     		\
 	soup-misc.c     		\
 	soup-multipart.c	     	\
+	soup-output-stream.h		\
+	soup-output-stream.c		\
 	soup-password-manager.c		\
 	soup-path-map.h     		\
 	soup-path-map.c     		\
