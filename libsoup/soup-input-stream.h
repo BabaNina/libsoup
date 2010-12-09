@@ -7,6 +7,7 @@
 #define SOUP_INPUT_STREAM_H 1
 
 #include <libsoup/soup-types.h>
+#include <libsoup/soup-message-headers.h>
 
 G_BEGIN_DECLS
 
@@ -38,6 +39,10 @@ typedef struct {
 GType soup_input_stream_get_type (void);
 
 GInputStream *soup_input_stream_new                   (GInputStream          *base_stream);
+
+void          soup_input_stream_set_encoding          (SoupInputStream       *sstream,
+						       SoupEncoding           encoding,
+						       goffset                content_length);
 
 gssize        soup_input_stream_read_line             (SoupInputStream       *sstream,
 						       void                  *buffer,

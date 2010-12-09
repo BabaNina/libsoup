@@ -9,14 +9,28 @@
 #include <config.h>
 #endif
 
+#include <stdlib.h>
 #include <string.h>
 #include <gio/gio.h>
 
 #include "soup-input-stream.h"
+#include "soup-message-headers.h"
+
+typedef enum {
+	SOUP_INPUT_STREAM_STATE_CHUNK_SIZE,
+	SOUP_INPUT_STREAM_STATE_CHUNK_END,
+	SOUP_INPUT_STREAM_STATE_CHUNK,
+	SOUP_INPUT_STREAM_STATE_TRAILERS,
+	SOUP_INPUT_STREAM_STATE_DONE
+} SoupInputStreamState;
 
 struct _SoupInputStreamPrivate {
 	GInputStream *base_stream;
-	GByteArray   *read_buf;
+	GByteArray   *buf;
+
+	SoupEncoding  encoding;
+	goffset       read_length;
+	SoupInputStreamState chunked_state;
 };
 
 static void soup_input_stream_pollable_init (GPollableInputStreamInterface *pollable_interface, gpointer interface_data);
@@ -24,6 +38,7 @@ static void soup_input_stream_pollable_init (GPollableInputStreamInterface *poll
 G_DEFINE_TYPE_WITH_CODE (SoupInputStream, soup_input_stream, G_TYPE_FILTER_INPUT_STREAM,
 			 G_IMPLEMENT_INTERFACE (G_TYPE_POLLABLE_INPUT_STREAM,
 						soup_input_stream_pollable_init))
+
 
 static void
 soup_input_stream_init (SoupInputStream *stream)
@@ -46,8 +61,8 @@ finalize (GObject *object)
 {
 	SoupInputStream *sstream = SOUP_INPUT_STREAM (object);
 
-	if (sstream->priv->read_buf)
-		g_byte_array_free (sstream->priv->read_buf, TRUE);
+	if (sstream->priv->buf)
+		g_byte_array_free (sstream->priv->buf, TRUE);
 
 	G_OBJECT_CLASS (soup_input_stream_parent_class)->finalize (object);
 }
@@ -55,22 +70,123 @@ finalize (GObject *object)
 static gssize
 read_from_buf (SoupInputStream *sstream, gpointer buffer, gsize count)
 {
-	GByteArray *read_buf = sstream->priv->read_buf;
+	GByteArray *buf = sstream->priv->buf;
 
-	if (read_buf->len < count)
-		count = read_buf->len;
-	memcpy (buffer, read_buf->data, count);
+	if (buf->len < count)
+		count = buf->len;
+	memcpy (buffer, buf->data, count);
 
-	if (count == read_buf->len) {
-		g_byte_array_free (read_buf, TRUE);
-		sstream->priv->read_buf = NULL;
+	if (count == buf->len) {
+		g_byte_array_free (buf, TRUE);
+		sstream->priv->buf = NULL;
 	} else {
-		memmove (read_buf->data, read_buf->data + count,
-			 read_buf->len - count);
-		g_byte_array_set_size (read_buf, read_buf->len - count);
+		memmove (buf->data, buf->data + count,
+			 buf->len - count);
+		g_byte_array_set_size (buf, buf->len - count);
 	}
 
 	return count;
+}
+
+static gssize
+soup_input_stream_read_raw (SoupInputStream  *sstream,
+			    void             *buffer,
+			    gsize             count,
+			    gboolean          blocking,
+			    GCancellable     *cancellable,
+			    GError          **error)
+{
+	gssize nread;
+
+	if (sstream->priv->buf) {
+		return read_from_buf (sstream, buffer, count);
+	} else if (blocking) {
+		nread = g_input_stream_read (sstream->priv->base_stream,
+					     buffer, count,
+					     cancellable, error);
+	} else {
+		nread = g_pollable_input_stream_read_nonblocking (
+			G_POLLABLE_INPUT_STREAM (sstream->priv->base_stream),
+			buffer, count, cancellable, error);
+	}
+
+	if (nread == 0 && sstream->priv->encoding != SOUP_ENCODING_EOF) {
+		g_set_error (error, G_IO_ERROR, G_IO_ERROR_PARTIAL_INPUT, NULL);
+		return -1;
+	}
+	return nread;
+}
+
+static gssize
+soup_input_stream_read_chunked (SoupInputStream  *sstream,
+				void             *buffer,
+				gsize             count,
+				gboolean          blocking,
+				GCancellable     *cancellable,
+				GError          **error)
+{
+	char metabuf[128];
+	gssize nread;
+
+again:
+	switch (sstream->priv->chunked_state) {
+	case SOUP_INPUT_STREAM_STATE_CHUNK_SIZE:
+	case SOUP_INPUT_STREAM_STATE_CHUNK_END:
+		if (blocking) {
+			nread = soup_input_stream_read_line (
+				sstream, metabuf, sizeof (metabuf),
+				cancellable, error);
+		} else {
+			nread = soup_input_stream_read_line_nonblocking (
+				sstream, metabuf, sizeof (metabuf),
+				cancellable, error);
+		}
+		if (nread <= 0)
+			return nread;
+		if (metabuf[nread - 1] != '\n')
+			return -1;
+
+		if (sstream->priv->chunked_state == SOUP_INPUT_STREAM_STATE_CHUNK_SIZE) {
+			sstream->priv->read_length = strtoul (metabuf, NULL, 16);
+			if (sstream->priv->read_length > 0)
+				sstream->priv->chunked_state = SOUP_INPUT_STREAM_STATE_CHUNK;
+			else
+				sstream->priv->chunked_state = SOUP_INPUT_STREAM_STATE_TRAILERS;
+		} else
+			sstream->priv->chunked_state = SOUP_INPUT_STREAM_STATE_CHUNK_SIZE;
+		break;
+
+	case SOUP_INPUT_STREAM_STATE_CHUNK:
+		nread = soup_input_stream_read_raw (sstream, buffer,
+						    MIN (count, sstream->priv->read_length),
+						    blocking, cancellable, error);
+		if (nread > 0) {
+			sstream->priv->read_length -= nread;
+			if (sstream->priv->read_length == 0)
+				sstream->priv->chunked_state = SOUP_INPUT_STREAM_STATE_CHUNK_END;
+		}
+		return nread;
+
+	case SOUP_INPUT_STREAM_STATE_TRAILERS:
+		if (blocking) {
+			nread = soup_input_stream_read_line (
+				sstream, buffer, count, cancellable, error);
+		} else {
+			nread = soup_input_stream_read_line_nonblocking (
+				sstream, buffer, count, cancellable, error);
+		}
+		if (nread <= 0)
+			return nread;
+
+		if (strncmp (buffer, "\r\n", nread) || strncmp (buffer, "\n", nread))
+			sstream->priv->chunked_state = SOUP_INPUT_STREAM_STATE_DONE;
+		break;
+		
+	case SOUP_INPUT_STREAM_STATE_DONE:
+		return 0;
+	}
+
+	goto again;
 }
 
 static gssize
@@ -81,13 +197,31 @@ soup_input_stream_read (GInputStream  *stream,
 			GError       **error)
 {
 	SoupInputStream *sstream = SOUP_INPUT_STREAM (stream);
+	gssize nread;
 
-	if (sstream->priv->read_buf) {
-		return read_from_buf (sstream, buffer, count);
-	} else {
-		return g_input_stream_read (sstream->priv->base_stream,
-					    buffer, count,
-					    cancellable, error);
+	switch (sstream->priv->encoding) {
+	case SOUP_ENCODING_CHUNKED:
+		return soup_input_stream_read_chunked (sstream, buffer, count,
+						       TRUE, cancellable,
+						       error);
+
+	case SOUP_ENCODING_CONTENT_LENGTH:
+		count = MIN (count, sstream->priv->read_length);
+		if (count == 0)
+			return 0;
+		nread = soup_input_stream_read_raw (sstream, buffer, count,
+						    TRUE, cancellable, error);
+		if (nread > 0)
+			sstream->priv->read_length -= nread;
+		return nread;
+
+	case SOUP_ENCODING_EOF:
+		return soup_input_stream_read_raw (sstream, buffer, count,
+						   TRUE, cancellable, error);
+
+	case SOUP_ENCODING_NONE:
+	default:
+		return 0;
 	}
 }
 
@@ -96,7 +230,7 @@ soup_input_stream_is_readable (GPollableInputStream *stream)
 {
 	SoupInputStream *sstream = SOUP_INPUT_STREAM (stream);
 
-	if (sstream->priv->read_buf)
+	if (sstream->priv->buf)
 		return TRUE;
 	else
 		return g_pollable_input_stream_is_readable (G_POLLABLE_INPUT_STREAM (sstream->priv->base_stream));
@@ -109,7 +243,7 @@ soup_input_stream_create_source (GPollableInputStream *stream,
 	SoupInputStream *sstream = SOUP_INPUT_STREAM (stream);
 	GSource *base_source, *pollable_source;
 
-	if (sstream->priv->read_buf)
+	if (sstream->priv->buf)
 		base_source = g_idle_source_new ();
 	else
 		base_source = g_pollable_input_stream_create_source (G_POLLABLE_INPUT_STREAM (sstream->priv->base_stream), cancellable);
@@ -120,6 +254,40 @@ soup_input_stream_create_source (GPollableInputStream *stream,
 	g_source_unref (base_source);
 
 	return pollable_source;
+}
+
+static gssize
+soup_input_stream_read_nonblocking (GPollableInputStream  *stream,
+				    void          *buffer,
+				    gsize          count,
+				    GError       **error)
+{
+	SoupInputStream *sstream = SOUP_INPUT_STREAM (stream);
+	gssize nread;
+
+	switch (sstream->priv->encoding) {
+	case SOUP_ENCODING_CHUNKED:
+		return soup_input_stream_read_chunked (sstream, buffer, count,
+						       FALSE, NULL, error);
+
+	case SOUP_ENCODING_CONTENT_LENGTH:
+		count = MIN (count, sstream->priv->read_length);
+		if (count == 0)
+			return 0;
+		nread = soup_input_stream_read_raw (sstream, buffer, count,
+						    FALSE, NULL, error);
+		if (nread > 0)
+			sstream->priv->read_length -= nread;
+		return nread;
+
+	case SOUP_ENCODING_EOF:
+		return soup_input_stream_read_raw (sstream, buffer, count,
+						   FALSE, NULL, error);
+
+	case SOUP_ENCODING_NONE:
+	default:
+		return 0;
+	}
 }
 
 static void
@@ -142,6 +310,7 @@ soup_input_stream_pollable_init (GPollableInputStreamInterface *pollable_interfa
 {
 	pollable_interface->is_readable = soup_input_stream_is_readable;
 	pollable_interface->create_source = soup_input_stream_create_source;
+	pollable_interface->read_nonblocking = soup_input_stream_read_nonblocking;
 }
 
 GInputStream *
@@ -151,6 +320,17 @@ soup_input_stream_new (GInputStream *base_stream)
 			     "base-stream", base_stream,
 			     "close-base-stream", FALSE,
 			     NULL);
+}
+
+void
+soup_input_stream_set_encoding (SoupInputStream *sstream,
+				SoupEncoding     encoding,
+				goffset          content_length)
+{
+	sstream->priv->encoding = encoding;
+	sstream->priv->read_length = content_length;
+	if (encoding == SOUP_ENCODING_CHUNKED)
+		sstream->priv->chunked_state = SOUP_INPUT_STREAM_STATE_CHUNK_SIZE;
 }
 
 gssize
@@ -165,11 +345,11 @@ soup_input_stream_read_line (SoupInputStream       *sstream,
 
 	g_return_val_if_fail (SOUP_IS_INPUT_STREAM (sstream), -1);
 
-	if (sstream->priv->read_buf) {
-		GByteArray *read_buf = sstream->priv->read_buf;
+	if (sstream->priv->buf) {
+		GByteArray *buf = sstream->priv->buf;
 
-		p = memchr (read_buf->data, '\n', read_buf->len);
-		nread = p ? p + 1 - read_buf->data : read_buf->len;
+		p = memchr (buf->data, '\n', buf->len);
+		nread = p ? p + 1 - buf->data : buf->len;
 		return read_from_buf (sstream, buffer, nread);
 	}
 
@@ -184,8 +364,8 @@ soup_input_stream_read_line (SoupInputStream       *sstream,
 		return nread;
 
 	p++;
-	sstream->priv->read_buf = g_byte_array_new ();
-	g_byte_array_append (sstream->priv->read_buf,
+	sstream->priv->buf = g_byte_array_new ();
+	g_byte_array_append (sstream->priv->buf,
 			     p, nread - (p - buf));
 	return p - buf;
 }
@@ -202,11 +382,11 @@ soup_input_stream_read_line_nonblocking (SoupInputStream       *sstream,
 
 	g_return_val_if_fail (SOUP_IS_INPUT_STREAM (sstream), -1);
 
-	if (sstream->priv->read_buf) {
-		GByteArray *read_buf = sstream->priv->read_buf;
+	if (sstream->priv->buf) {
+		GByteArray *buf = sstream->priv->buf;
 
-		p = memchr (read_buf->data, '\n', read_buf->len);
-		nread = p ? p + 1 - read_buf->data : read_buf->len;
+		p = memchr (buf->data, '\n', buf->len);
+		nread = p ? p + 1 - buf->data : buf->len;
 		return read_from_buf (sstream, buffer, nread);
 	}
 
@@ -221,8 +401,8 @@ soup_input_stream_read_line_nonblocking (SoupInputStream       *sstream,
 		return nread;
 
 	p++;
-	sstream->priv->read_buf = g_byte_array_new ();
-	g_byte_array_append (sstream->priv->read_buf,
+	sstream->priv->buf = g_byte_array_new ();
+	g_byte_array_append (sstream->priv->buf,
 			     p, nread - (p - buf));
 	return p - buf;
 }
