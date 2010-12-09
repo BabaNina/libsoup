@@ -131,7 +131,6 @@ soup_input_stream_read_chunked (SoupInputStream  *sstream,
 again:
 	switch (sstream->priv->chunked_state) {
 	case SOUP_INPUT_STREAM_STATE_CHUNK_SIZE:
-	case SOUP_INPUT_STREAM_STATE_CHUNK_END:
 		nread = soup_input_stream_read_line (sstream,
 						     metabuf, sizeof (metabuf),
 						     blocking,
@@ -141,14 +140,11 @@ again:
 		if (metabuf[nread - 1] != '\n')
 			return -1;
 
-		if (sstream->priv->chunked_state == SOUP_INPUT_STREAM_STATE_CHUNK_SIZE) {
-			sstream->priv->read_length = strtoul (metabuf, NULL, 16);
-			if (sstream->priv->read_length > 0)
-				sstream->priv->chunked_state = SOUP_INPUT_STREAM_STATE_CHUNK;
-			else
-				sstream->priv->chunked_state = SOUP_INPUT_STREAM_STATE_TRAILERS;
-		} else
-			sstream->priv->chunked_state = SOUP_INPUT_STREAM_STATE_CHUNK_SIZE;
+		sstream->priv->read_length = strtoul (metabuf, NULL, 16);
+		if (sstream->priv->read_length > 0)
+			sstream->priv->chunked_state = SOUP_INPUT_STREAM_STATE_CHUNK;
+		else
+			sstream->priv->chunked_state = SOUP_INPUT_STREAM_STATE_TRAILERS;
 		break;
 
 	case SOUP_INPUT_STREAM_STATE_CHUNK:
@@ -161,6 +157,19 @@ again:
 				sstream->priv->chunked_state = SOUP_INPUT_STREAM_STATE_CHUNK_END;
 		}
 		return nread;
+
+	case SOUP_INPUT_STREAM_STATE_CHUNK_END:
+		nread = soup_input_stream_read_line (sstream,
+						     metabuf, sizeof (metabuf),
+						     blocking,
+						     cancellable, error);
+		if (nread <= 0)
+			return nread;
+		if (metabuf[nread - 1] != '\n')
+			return -1;
+
+		sstream->priv->chunked_state = SOUP_INPUT_STREAM_STATE_CHUNK_SIZE;
+		break;
 
 	case SOUP_INPUT_STREAM_STATE_TRAILERS:
 		nread = soup_input_stream_read_line (sstream, buffer, count,
