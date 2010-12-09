@@ -360,24 +360,6 @@ read_metadata (SoupMessage *msg, gboolean to_blank)
 		if (nread > 0) {
 			g_byte_array_append (io->read_meta_buf, read_buf, nread);
 			got_lf = memchr (read_buf, '\n', nread) != NULL;
-		} else if (nread == 0) {
-			/* More lame server handling... deal with
-			 * servers that don't send the final chunk.
-			 */
-			if (io->read_state == SOUP_MESSAGE_IO_STATE_CHUNK_SIZE &&
-			    io->read_meta_buf->len == 0) {
-				g_byte_array_append (io->read_meta_buf,
-						     (guchar *)"0\r\n", 3);
-				got_lf = TRUE;
-			} else if (io->read_state == SOUP_MESSAGE_IO_STATE_TRAILERS &&
-				   io->read_meta_buf->len == 0) {
-				g_byte_array_append (io->read_meta_buf,
-						     (guchar *)"\r\n", 2);
-				got_lf = TRUE;
-			} else {
-				io_error (io->sock, msg, NULL);
-				return FALSE;
-			}
 		} else {
 			io_error (io->sock, msg, error);
 			return FALSE;
