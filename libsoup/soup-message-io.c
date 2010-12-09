@@ -50,10 +50,10 @@ typedef struct {
 	SoupMessageIOMode     mode;
 
 	SoupSocket           *sock;
-	GInputStream         *istream;
+	SoupInputStream      *istream;
 	GOutputStream        *ostream;
 	GMainContext         *async_context;
-	gboolean              non_blocking;
+	gboolean              blocking;
 
 	SoupMessageIOState    read_state;
 	SoupEncoding          read_encoding;
@@ -184,7 +184,7 @@ soup_message_io_finished (SoupMessage *msg)
 	g_object_unref (msg);
 }
 
-static gboolean io_read (GInputStream *stream, SoupMessage *msg);
+static gboolean io_read (SoupInputStream *stream, SoupMessage *msg);
 static gboolean io_write (GOutputStream *stream, SoupMessage *msg);
 
 static gboolean
@@ -346,17 +346,10 @@ read_metadata (SoupMessage *msg, gboolean to_blank)
 	}
 
 	while (1) {
-		if (io->non_blocking) {
-			nread = soup_input_stream_read_line_nonblocking (
-				SOUP_INPUT_STREAM (io->istream),
-				read_buf, sizeof (read_buf),
-				NULL, &error);
-		} else {
-			nread = soup_input_stream_read_line (
-				SOUP_INPUT_STREAM (io->istream),
-				read_buf, sizeof (read_buf),
-				NULL, &error);
-		}
+		nread = soup_input_stream_read_line (io->istream, read_buf,
+						     sizeof (read_buf),
+						     io->blocking,
+						     NULL, &error);
 
 		if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_WOULD_BLOCK)) {
 			g_error_free (error);
@@ -489,18 +482,11 @@ read_body_chunk (SoupMessage *msg)
 						  RESPONSE_BLOCK_SIZE);
 		}
 
-		if (io->non_blocking) {
-			nread = g_pollable_input_stream_read_nonblocking (
-				G_POLLABLE_INPUT_STREAM (io->istream),
-				(guchar *)buffer->data, buffer->length,
-				NULL, &error);
-		} else {
-			nread = g_input_stream_read (io->istream,
-						     (guchar *)buffer->data,
-						     buffer->length,
-						     NULL, &error);
-		}
-
+		nread = soup_input_stream_read (io->istream,
+						(guchar *)buffer->data,
+						buffer->length,
+						io->blocking,
+						NULL, &error);
 		if (nread > 0) {
 			buffer->length = nread;
 			io->read_length -= nread;
@@ -569,16 +555,16 @@ write_data (SoupMessage *msg, const char *data, guint len, gboolean body)
 	}
 
 	while (len > io->written) {
-		if (io->non_blocking) {
-			nwrote = g_pollable_output_stream_write_nonblocking (
-				G_POLLABLE_OUTPUT_STREAM (io->ostream),
-				data + io->written, len - io->written,
-				NULL, &error);
-		} else {
+		if (io->blocking) {
 			nwrote = g_output_stream_write (io->ostream,
 							data + io->written,
 							len - io->written,
 							NULL, &error);
+		} else {
+			nwrote = g_pollable_output_stream_write_nonblocking (
+				G_POLLABLE_OUTPUT_STREAM (io->ostream),
+				data + io->written, len - io->written,
+				NULL, &error);
 		}
 
 		if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_WOULD_BLOCK)) {
@@ -882,7 +868,7 @@ io_write (GOutputStream *stream, SoupMessage *msg)
 }
 
 static gboolean
-io_read (GInputStream *stream, SoupMessage *msg)
+io_read (SoupInputStream *stream, SoupMessage *msg)
 {
 	SoupMessagePrivate *priv = SOUP_MESSAGE_GET_PRIVATE (msg);
 	SoupMessageIOData *io = priv->io_data;
@@ -954,7 +940,7 @@ io_read (GInputStream *stream, SoupMessage *msg)
 			}
 		}
 
-		soup_input_stream_set_encoding (SOUP_INPUT_STREAM (io->istream),
+		soup_input_stream_set_encoding (io->istream,
 						io->read_encoding,
 						io->read_length);
 
@@ -1093,6 +1079,7 @@ new_iostate (SoupMessage *msg, SoupSocket *sock, SoupMessageIOMode mode,
 	SoupMessagePrivate *priv = SOUP_MESSAGE_GET_PRIVATE (msg);
 	SoupMessageIOData *io;
 	GIOStream *iostream;
+	gboolean non_blocking;
 
 	io = g_slice_new0 (SoupMessageIOData);
 	io->mode = mode;
@@ -1109,9 +1096,10 @@ new_iostate (SoupMessage *msg, SoupSocket *sock, SoupMessageIOMode mode,
 		io->ostream = g_io_stream_get_output_stream (iostream);
 	}
 	g_object_get (io->sock,
-		      SOUP_SOCKET_FLAG_NONBLOCKING, &io->non_blocking,
+		      SOUP_SOCKET_FLAG_NONBLOCKING, &non_blocking,
 		      SOUP_SOCKET_ASYNC_CONTEXT, &io->async_context,
 		      NULL);
+	io->blocking = !non_blocking;
 
 	io->read_meta_buf    = g_byte_array_new ();
 	io->write_buf        = g_string_new (NULL);
@@ -1230,24 +1218,16 @@ soup_message_io_unpause (SoupMessage *msg)
 {
 	SoupMessagePrivate *priv = SOUP_MESSAGE_GET_PRIVATE (msg);
 	SoupMessageIOData *io = priv->io_data;
-	gboolean non_blocking;
-	GMainContext *async_context;
 
 	g_return_if_fail (io != NULL);
 
-	g_object_get (io->sock,
-		      SOUP_SOCKET_FLAG_NONBLOCKING, &non_blocking,
-		      SOUP_SOCKET_ASYNC_CONTEXT, &async_context,
-		      NULL);
-	if (non_blocking) {
+	if (!io->blocking) {
 		if (!io->unpause_source) {
 			io->unpause_source = soup_add_completion (
-				async_context, io_unpause_internal, msg);
+				io->async_context, io_unpause_internal, msg);
 		}
 	} else
 		io_unpause_internal (msg);
-	if (async_context)
-		g_main_context_unref (async_context);
 }
 
 /**

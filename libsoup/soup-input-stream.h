@@ -38,22 +38,25 @@ typedef struct {
 
 GType soup_input_stream_get_type (void);
 
-GInputStream *soup_input_stream_new                   (GInputStream          *base_stream);
+SoupInputStream *soup_input_stream_new          (GInputStream     *base_stream);
 
-void          soup_input_stream_set_encoding          (SoupInputStream       *sstream,
-						       SoupEncoding           encoding,
-						       goffset                content_length);
+void             soup_input_stream_set_encoding (SoupInputStream  *sstream,
+						 SoupEncoding      encoding,
+						 goffset           content_length);
 
-gssize        soup_input_stream_read_line             (SoupInputStream       *sstream,
-						       void                  *buffer,
-						       gsize                  length,
-						       GCancellable          *cancellable,
-						       GError               **error);
-gssize        soup_input_stream_read_line_nonblocking (SoupInputStream       *sstream,
-						       void                  *buffer,
-						       gsize                  length,
-						       GCancellable          *cancellable,
-						       GError               **error);
+gssize           soup_input_stream_read         (SoupInputStream  *sstream,
+						 void             *buffer,
+						 gsize             count,
+						 gboolean          blocking,
+						 GCancellable     *cancellable,
+						 GError          **error);
+
+gssize           soup_input_stream_read_line    (SoupInputStream  *sstream,
+						 void             *buffer,
+						 gsize             length,
+						 gboolean          blocking,
+						 GCancellable     *cancellable,
+						 GError          **error);
 
 G_END_DECLS
 

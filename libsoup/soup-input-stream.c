@@ -132,15 +132,10 @@ again:
 	switch (sstream->priv->chunked_state) {
 	case SOUP_INPUT_STREAM_STATE_CHUNK_SIZE:
 	case SOUP_INPUT_STREAM_STATE_CHUNK_END:
-		if (blocking) {
-			nread = soup_input_stream_read_line (
-				sstream, metabuf, sizeof (metabuf),
-				cancellable, error);
-		} else {
-			nread = soup_input_stream_read_line_nonblocking (
-				sstream, metabuf, sizeof (metabuf),
-				cancellable, error);
-		}
+		nread = soup_input_stream_read_line (sstream,
+						     metabuf, sizeof (metabuf),
+						     blocking,
+						     cancellable, error);
 		if (nread <= 0)
 			return nread;
 		if (metabuf[nread - 1] != '\n')
@@ -168,13 +163,8 @@ again:
 		return nread;
 
 	case SOUP_INPUT_STREAM_STATE_TRAILERS:
-		if (blocking) {
-			nread = soup_input_stream_read_line (
-				sstream, buffer, count, cancellable, error);
-		} else {
-			nread = soup_input_stream_read_line_nonblocking (
-				sstream, buffer, count, cancellable, error);
-		}
+		nread = soup_input_stream_read_line (sstream, buffer, count,
+						     blocking, cancellable, error);
 		if (nread <= 0)
 			return nread;
 
@@ -190,11 +180,11 @@ again:
 }
 
 static gssize
-soup_input_stream_read (GInputStream  *stream,
-			void          *buffer,
-			gsize          count,
-			GCancellable  *cancellable,
-			GError       **error)
+soup_input_stream_read_fn (GInputStream  *stream,
+			   void          *buffer,
+			   gsize          count,
+			   GCancellable  *cancellable,
+			   GError       **error)
 {
 	SoupInputStream *sstream = SOUP_INPUT_STREAM (stream);
 	gssize nread;
@@ -301,7 +291,7 @@ soup_input_stream_class_init (SoupInputStreamClass *stream_class)
 	object_class->constructed = constructed;
 	object_class->finalize = finalize;
 
-	input_stream_class->read_fn = soup_input_stream_read;
+	input_stream_class->read_fn = soup_input_stream_read_fn;
 }
 
 static void
@@ -313,7 +303,7 @@ soup_input_stream_pollable_init (GPollableInputStreamInterface *pollable_interfa
 	pollable_interface->read_nonblocking = soup_input_stream_read_nonblocking;
 }
 
-GInputStream *
+SoupInputStream *
 soup_input_stream_new (GInputStream *base_stream)
 {
 	return g_object_new (SOUP_TYPE_INPUT_STREAM,
@@ -334,9 +324,29 @@ soup_input_stream_set_encoding (SoupInputStream *sstream,
 }
 
 gssize
+soup_input_stream_read (SoupInputStream       *sstream,
+			void                  *buffer,
+			gsize                  count,
+			gboolean               blocking,
+			GCancellable          *cancellable,
+			GError               **error)
+{
+	if (blocking) {
+		return g_input_stream_read (G_INPUT_STREAM (sstream),
+					    buffer, count,
+					    cancellable, error);
+	} else {
+		return g_pollable_input_stream_read_nonblocking (
+			G_POLLABLE_INPUT_STREAM (sstream),
+			buffer, count, cancellable, error);
+	}
+}
+
+gssize
 soup_input_stream_read_line (SoupInputStream       *sstream,
 			     void                  *buffer,
 			     gsize                  length,
+			     gboolean               blocking,
 			     GCancellable          *cancellable,
 			     GError               **error)
 {
@@ -353,46 +363,15 @@ soup_input_stream_read_line (SoupInputStream       *sstream,
 		return read_from_buf (sstream, buffer, nread);
 	}
 
-	nread = g_input_stream_read (sstream->priv->base_stream,
-				     buffer, length,
-				     cancellable, error);
-	if (nread <= 0)
-		return nread;
-
-	p = memchr (buffer, '\n', nread);
-	if (!p || p == buf + nread - 1)
-		return nread;
-
-	p++;
-	sstream->priv->buf = g_byte_array_new ();
-	g_byte_array_append (sstream->priv->buf,
-			     p, nread - (p - buf));
-	return p - buf;
-}
-
-gssize
-soup_input_stream_read_line_nonblocking (SoupInputStream       *sstream,
-					 void                  *buffer,
-					 gsize                  length,
-					 GCancellable          *cancellable,
-					 GError               **error)
-{
-	gssize nread;
-	guint8 *p, *buf = buffer;
-
-	g_return_val_if_fail (SOUP_IS_INPUT_STREAM (sstream), -1);
-
-	if (sstream->priv->buf) {
-		GByteArray *buf = sstream->priv->buf;
-
-		p = memchr (buf->data, '\n', buf->len);
-		nread = p ? p + 1 - buf->data : buf->len;
-		return read_from_buf (sstream, buffer, nread);
+	if (blocking) {
+		nread = g_input_stream_read (G_INPUT_STREAM (sstream->priv->base_stream),
+					     buffer, length,
+					     cancellable, error);
+	} else {
+		nread = g_pollable_input_stream_read_nonblocking (
+			G_POLLABLE_INPUT_STREAM (sstream->priv->base_stream),
+			buffer, length, cancellable, error);
 	}
-
-	nread = g_pollable_input_stream_read_nonblocking (
-		G_POLLABLE_INPUT_STREAM (sstream->priv->base_stream),
-		buffer, length, cancellable, error);
 	if (nread <= 0)
 		return nread;
 
