@@ -13,6 +13,7 @@
 #include <string.h>
 
 #include "soup-connection.h"
+#include "soup-converter-wrapper.h"
 #include "soup-input-stream.h"
 #include "soup-message.h"
 #include "soup-message-private.h"
@@ -50,6 +51,7 @@ typedef struct {
 
 	SoupSocket           *sock;
 	SoupInputStream      *istream;
+	GInputStream         *body_istream;
 	SoupOutputStream     *ostream;
 	GMainContext         *async_context;
 	gboolean              blocking;
@@ -121,6 +123,8 @@ soup_message_io_cleanup (SoupMessage *msg)
 		g_object_remove_weak_pointer (G_OBJECT (io->istream), (gpointer *)&io->istream);
 	if (io->ostream)
 		g_object_remove_weak_pointer (G_OBJECT (io->ostream), (gpointer *)&io->ostream);
+	if (io->body_istream)
+		g_object_unref (io->body_istream);
 	if (io->async_context)
 		g_main_context_unref (io->async_context);
 	if (io->item)
@@ -360,83 +364,28 @@ read_metadata (SoupMessage *msg)
 	return TRUE;
 }
 
-static SoupBuffer *
-content_decode_one (SoupBuffer *buf, GConverter *converter, GError **error)
-{
-	gsize outbuf_length, outbuf_used, outbuf_cur, input_used, input_cur;
-	char *outbuf;
-	GConverterResult result;
-
-	outbuf_length = MAX (buf->length * 2, 1024);
-	outbuf = g_malloc (outbuf_length);
-	outbuf_cur = input_cur = 0;
-
-	do {
-		result = g_converter_convert (
-			converter,
-			buf->data + input_cur, buf->length - input_cur,
-			outbuf + outbuf_cur, outbuf_length - outbuf_cur,
-			0, &input_used, &outbuf_used, error);
-		input_cur += input_used;
-		outbuf_cur += outbuf_used;
-
-		if (g_error_matches (*error, G_IO_ERROR, G_IO_ERROR_NO_SPACE) ||
-		    (!*error && outbuf_cur == outbuf_length)) {
-			g_clear_error (error);
-			outbuf_length *= 2;
-			outbuf = g_realloc (outbuf, outbuf_length);
-		} else if (*error) {
-			/* GZlibDecompressor can't ever return
-			 * G_IO_ERROR_PARTIAL_INPUT unless we pass it
-			 * input_length = 0, which we don't. Other
-			 * converters might of course, so eventually
-			 * this code needs to be rewritten to deal
-			 * with that.
-			 */
-			g_free (outbuf);
-			return NULL;
-		}
-	} while (input_cur < buf->length && result != G_CONVERTER_FINISHED);
-
-	if (outbuf_cur)
-		return soup_buffer_new (SOUP_MEMORY_TAKE, outbuf, outbuf_cur);
-	else {
-		g_free (outbuf);
-		return NULL;
-	}
-}
-
-static SoupBuffer *
-content_decode (SoupMessage *msg, SoupBuffer *buf)
+static void
+setup_body_istream (SoupMessage *msg)
 {
 	SoupMessagePrivate *priv = SOUP_MESSAGE_GET_PRIVATE (msg);
-	GConverter *decoder;
-	SoupBuffer *decoded;
-	GError *error = NULL;
+	SoupMessageIOData *io = priv->io_data;
+	GConverter *decoder, *wrapper;
+	GInputStream *filter;
 	GSList *d;
+
+	io->body_istream = g_object_ref (io->istream);
 
 	for (d = priv->decoders; d; d = d->next) {
 		decoder = d->data;
-
-		decoded = content_decode_one (buf, decoder, &error);
-		if (error) {
-			if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_FAILED))
-				g_warning ("Content-Decoding error: %s\n", error->message);
-			g_error_free (error);
-
-			soup_message_set_flags (msg, priv->msg_flags & ~SOUP_MESSAGE_CONTENT_DECODED);
-			break;
-		}
-		if (buf)
-			soup_buffer_free (buf);
-
-		if (decoded)
-			buf = decoded;
-		else
-			return NULL;
+		wrapper = soup_converter_wrapper_new (decoder, msg);
+		filter = g_object_new (G_TYPE_CONVERTER_INPUT_STREAM,
+				       "base-stream", io->body_istream,
+				       "close-base-stream", FALSE,
+				       "converter", wrapper,
+				       NULL);
+		g_object_unref (io->body_istream);
+		io->body_istream = filter;
 	}
-
-	return buf;
 }
 
 static gssize
@@ -844,6 +793,9 @@ io_read (SoupInputStream *stream, SoupMessage *msg)
 		     io->read_length == 0))
 			goto read_done;
 
+		if (!io->body_istream)
+			setup_body_istream (msg);
+
 		if (!io_handle_sniffing (msg, FALSE))
 			goto out;
 
@@ -861,17 +813,13 @@ io_read (SoupInputStream *stream, SoupMessage *msg)
 						  RESPONSE_BLOCK_SIZE);
 		}
 
-		nread = g_input_stream_read (G_INPUT_STREAM (io->istream),
+		nread = g_input_stream_read (io->body_istream,
 					     (guchar *)buffer->data,
 					     buffer->length,
 					     io->cancellable, &error);
 		if (nread > 0) {
 			buffer->length = nread;
 			io->read_length -= nread;
-
-			buffer = content_decode (msg, buffer);
-			if (!buffer)
-				break;
 
 			soup_message_body_got_chunk (io->read_body, buffer);
 
