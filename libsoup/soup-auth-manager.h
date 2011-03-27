@@ -32,6 +32,9 @@ typedef struct {
 
 GType soup_auth_manager_get_type (void);
 
+void soup_auth_manager_use_auth (SoupAuthManager *manager, SoupURI *uri,
+				 const char *scheme, const char *realm);
+
 G_END_DECLS
 
 #endif /* SOUP_AUTH_MANAGER_H */

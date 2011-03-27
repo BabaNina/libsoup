@@ -87,8 +87,7 @@ foreach_free_host (gpointer key, gpointer value, gpointer data)
 {
 	SoupAuthHost *host = value;
 
-	if (host->auth_realms)
-		soup_path_map_free (host->auth_realms);
+	soup_path_map_free (host->auth_realms);
 	if (host->auths)
 		g_hash_table_destroy (host->auths);
 
@@ -359,10 +358,9 @@ check_auth (SoupMessage *msg, SoupAuth *auth)
 }
 
 static SoupAuthHost *
-get_auth_host_for_message (SoupAuthManagerPrivate *priv, SoupMessage *msg)
+get_auth_host_for_uri (SoupAuthManagerPrivate *priv, SoupURI *uri)
 {
 	SoupAuthHost *host;
-	SoupURI *uri = soup_message_get_uri (msg);
 
 	host = g_hash_table_lookup (priv->auth_hosts, uri);
 	if (host)
@@ -370,6 +368,7 @@ get_auth_host_for_message (SoupAuthManagerPrivate *priv, SoupMessage *msg)
 
 	host = g_slice_new0 (SoupAuthHost);
 	host->uri = soup_uri_copy_host (uri);
+	host->auth_realms = soup_path_map_new (g_free);
 	g_hash_table_insert (priv->auth_hosts, host->uri, host);
 
 	return host;
@@ -381,8 +380,8 @@ lookup_auth (SoupAuthManagerPrivate *priv, SoupMessage *msg)
 	SoupAuthHost *host;
 	const char *path, *realm;
 
-	host = get_auth_host_for_message (priv, msg);
-	if (!host->auth_realms)
+	host = get_auth_host_for_uri (priv, soup_message_get_uri (msg));
+	if (!host->auths)
 		return NULL;
 
 	path = soup_message_get_uri (msg)->path;
@@ -519,7 +518,7 @@ auth_got_headers (SoupMessage *msg, gpointer manager)
 		}
 	}
 
-	host = get_auth_host_for_message (priv, msg);
+	host = get_auth_host_for_uri (priv, soup_message_get_uri (msg));
 
 	/* See if we used auth last time */
 	prior_auth = soup_message_get_auth (msg);
@@ -533,12 +532,6 @@ auth_got_headers (SoupMessage *msg, gpointer manager)
 			return;
 	}
 	auth_info = soup_auth_get_info (auth);
-
-	if (!host->auth_realms) {
-		host->auth_realms = soup_path_map_new (g_free);
-		host->auths = g_hash_table_new_full (g_str_hash, g_str_equal,
-						     g_free, g_object_unref);
-	}
 
 	/* Record where this auth realm is used. */
 	pspace = soup_auth_get_protection_space (auth, soup_message_get_uri (msg));
@@ -560,6 +553,10 @@ auth_got_headers (SoupMessage *msg, gpointer manager)
 	 * pre-existing auth, we keep that rather than the new one,
 	 * since the old one might already be authenticated.)
 	 */
+	if (!host->auths) {
+		host->auths = g_hash_table_new_full (g_str_hash, g_str_equal,
+						     g_free, g_object_unref);
+	}
 	old_auth = g_hash_table_lookup (host->auths, auth_info);
 	if (old_auth) {
 		g_free (auth_info);
@@ -672,4 +669,20 @@ request_unqueued (SoupSessionFeature *manager, SoupSession *session,
 {
 	g_signal_handlers_disconnect_matched (msg, G_SIGNAL_MATCH_DATA,
 					      0, 0, NULL, NULL, manager);
+}
+
+void
+soup_auth_manager_use_auth (SoupAuthManager *manager, SoupURI *uri,
+			    const char *scheme, const char *realm)
+{
+	SoupAuthManagerPrivate *priv = SOUP_AUTH_MANAGER_GET_PRIVATE (manager);
+	SoupAuthHost *host;
+	char *auth_info;
+
+	host = get_auth_host_for_uri (priv, uri);
+	if (soup_path_map_lookup (host->auth_realms, uri->path))
+		soup_path_map_remove (host->auth_realms, uri->path);
+
+	auth_info = g_strdup_printf ("%s:%s", scheme, realm);
+	soup_path_map_add (host->auth_realms, uri->path, g_strdup (auth_info));
 }
