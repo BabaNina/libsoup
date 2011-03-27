@@ -231,13 +231,6 @@ has_feature (SoupSessionFeature *feature, GType type)
 	return FALSE;
 }
 
-void
-soup_auth_manager_emit_authenticate (SoupAuthManager *manager, SoupMessage *msg,
-				     SoupAuth *auth, gboolean retrying)
-{
-	g_signal_emit (manager, signals[AUTHENTICATE], 0, msg, auth, retrying);
-}
-
 static void
 attach (SoupSessionFeature *manager, SoupSession *session)
 {
@@ -434,8 +427,8 @@ authenticate_auth (SoupAuthManager *manager, SoupAuth *auth,
 		if (!prior_auth_failed)
 			soup_auth_authenticate (auth, uri->user, uri->password);
 	} else if (!soup_auth_is_authenticated (auth) && can_interact) {
-		soup_auth_manager_emit_authenticate (manager, msg, auth,
-						     prior_auth_failed);
+		g_signal_emit (manager, signals[AUTHENTICATE], 0,
+			       msg, auth, prior_auth_failed);
 	}
 
 	return soup_auth_is_authenticated (auth);
@@ -520,7 +513,8 @@ auth_got_headers (SoupMessage *msg, gpointer manager)
 
 		header = auth_header_for_message (msg);
 		if (header && soup_auth_update (auth, msg, header)) {
-			soup_auth_manager_emit_authenticate (manager, msg, auth, FALSE);
+			g_signal_emit (manager, signals[AUTHENTICATE], 0,
+				       msg, auth, FALSE);
 			return;
 		}
 	}
