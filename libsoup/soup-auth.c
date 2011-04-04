@@ -463,9 +463,12 @@ soup_auth_get_info (SoupAuth *auth)
 {
 	g_return_val_if_fail (SOUP_IS_AUTH (auth), NULL);
 
-	return g_strdup_printf ("%s:%s",
-				SOUP_AUTH_GET_CLASS (auth)->scheme_name,
-				auth->realm);
+	if (auth->realm) {
+		return g_strdup_printf ("%s:%s",
+					SOUP_AUTH_GET_CLASS (auth)->scheme_name,
+					auth->realm);
+	} else
+		return g_strdup (SOUP_AUTH_GET_CLASS (auth)->scheme_name);
 }
 
 /**

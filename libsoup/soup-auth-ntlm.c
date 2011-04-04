@@ -178,7 +178,16 @@ update_connection (SoupConnectionAuth *auth, SoupMessage *msg,
 static GSList *
 get_protection_space (SoupAuth *auth, SoupURI *source_uri)
 {
-	g_return_val_if_reached (NULL);
+	char *space, *p;
+
+	space = g_strdup (source_uri->path);
+
+	/* Strip query and filename component */
+	p = strrchr (space, '/');
+	if (p && p != space && p[1])
+		*p = '\0';
+
+	return g_slist_prepend (NULL, space);
 }
 
 static void

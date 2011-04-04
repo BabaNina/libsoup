@@ -22,6 +22,7 @@
 #include <glib.h>
 #include <libsoup/soup-address.h>
 #include <libsoup/soup-auth.h>
+#include <libsoup/soup-auth-manager.h>
 #include <libsoup/soup-message.h>
 #include <libsoup/soup-server.h>
 #include <libsoup/soup-session-async.h>
@@ -339,8 +340,16 @@ do_ntlm_round (SoupURI *base_uri, gboolean use_ntlm, const char *user)
 	g_return_if_fail (use_ntlm || !alice);
 
 	session = soup_test_session_new (SOUP_TYPE_SESSION_ASYNC, NULL);
-	if (use_ntlm)
+	if (use_ntlm) {
+		SoupAuthManager *auth_manager;
+		SoupAuth *ntlm;
+
 		soup_session_add_feature_by_type (session, SOUP_TYPE_AUTH_NTLM);
+		auth_manager = SOUP_AUTH_MANAGER (soup_session_get_feature (session, SOUP_TYPE_AUTH_MANAGER));
+		ntlm = g_object_new (SOUP_TYPE_AUTH_NTLM, NULL);
+		soup_auth_manager_use_auth (auth_manager, base_uri, ntlm);
+		g_object_unref (ntlm);
+	}
 
 	if (user) {
 		g_signal_connect (session, "authenticate",

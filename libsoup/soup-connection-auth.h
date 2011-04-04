@@ -32,6 +32,9 @@ typedef struct {
 	char     *(*get_connection_authorization) (SoupConnectionAuth *auth,
 						   SoupMessage        *msg,
 						   SoupSocket         *sock);
+	gboolean  (*is_ready_for_connection)      (SoupConnectionAuth *auth,
+						   SoupMessage        *msg,
+						   SoupSocket         *sock);
 } SoupConnectionAuthClass;
 
 GType soup_connection_auth_get_type (void);
