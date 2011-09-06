@@ -1,0 +1,31 @@
+emit chunks
+write to file(?)
+  continue
+output chunk(s?)
+
+input chunks
+input buffer
+read from file(?)
+restart-write
+
+progress (up/down)
+
+metadata (in/out)
+  set specific http headers? or just some? cookies?
+
+debugging
+
+URIs: http, ftp, file, data, plug-in (via class)
+
+allow http->ftp redir
+
+proxy resolver
+
+auth, proxy auth
+
+timeouts
+
+webkit will (eventually) need ftp dir listing support...
+
+
+http://developer.apple.com/documentation/Cocoa/Conceptual/URLLoadingSystem/URLLoadingSystem.html#//apple_ref/doc/uid/10000165
