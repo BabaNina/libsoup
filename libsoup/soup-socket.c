@@ -16,8 +16,9 @@
 #include <string.h>
 #include <unistd.h>
 
-#include "soup-address.h"
 #include "soup-socket.h"
+#include "soup-address.h"
+#include "soup-input-stream.h"
 #include "soup-marshal.h"
 #include "soup-misc.h"
 #include "soup-misc-private.h"
@@ -127,6 +128,7 @@ disconnect_internal (SoupSocket *sock)
 			g_signal_handlers_disconnect_by_func (priv->conn, soup_socket_peer_certificate_changed, sock);
 		g_object_unref (priv->conn);
 		priv->conn = NULL;
+		g_object_unref (priv->istream);
 		priv->istream = NULL;
 		g_object_unref (priv->ostream);
 		priv->ostream = NULL;
@@ -474,7 +476,7 @@ finish_socket_setup (SoupSocketPrivate *priv)
 	if (!priv->conn)
 		priv->conn = (GIOStream *)g_socket_connection_factory_create_connection (priv->gsock);
 	if (!priv->istream)
-		priv->istream = G_POLLABLE_INPUT_STREAM (g_io_stream_get_input_stream (priv->conn));
+		priv->istream = G_POLLABLE_INPUT_STREAM (soup_input_stream_new (g_io_stream_get_input_stream (priv->conn), !priv->non_blocking));
 	if (!priv->ostream)
 		priv->ostream = G_POLLABLE_OUTPUT_STREAM (soup_output_stream_new (g_io_stream_get_output_stream (priv->conn), !priv->non_blocking));
 
@@ -986,7 +988,7 @@ soup_socket_start_proxy_ssl (SoupSocket *sock, const char *ssl_host,
 	g_signal_connect (priv->conn, "notify::peer-certificate",
 			  G_CALLBACK (soup_socket_peer_certificate_changed), sock);
 
-	priv->istream = G_POLLABLE_INPUT_STREAM (g_io_stream_get_input_stream (priv->conn));
+	priv->istream = G_POLLABLE_INPUT_STREAM (soup_input_stream_new (g_io_stream_get_input_stream (priv->conn), !priv->non_blocking));
 	priv->ostream = G_POLLABLE_OUTPUT_STREAM (soup_output_stream_new (g_io_stream_get_output_stream (priv->conn), !priv->non_blocking));
 	return TRUE;
 }
@@ -1215,6 +1217,14 @@ soup_socket_get_remote_address (SoupSocket *sock)
 	g_mutex_unlock (priv->addrlock);
 
 	return priv->remote_addr;
+}
+
+GInputStream *
+soup_socket_get_input_stream (SoupSocket *sock)
+{
+	g_return_val_if_fail (SOUP_IS_SOCKET (sock), NULL);
+
+	return G_INPUT_STREAM (SOUP_SOCKET_GET_PRIVATE (sock)->istream);
 }
 
 GOutputStream *

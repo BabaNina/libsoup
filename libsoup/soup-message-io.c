@@ -13,6 +13,7 @@
 #include <string.h>
 
 #include "soup-connection.h"
+#include "soup-input-stream.h"
 #include "soup-message.h"
 #include "soup-message-private.h"
 #include "soup-message-queue.h"
@@ -31,9 +32,7 @@ typedef enum {
 	SOUP_MESSAGE_IO_STATE_BLOCKING,
 	SOUP_MESSAGE_IO_STATE_BODY,
 	SOUP_MESSAGE_IO_STATE_BODY_DATA,
-	SOUP_MESSAGE_IO_STATE_CHUNK_SIZE,
-	SOUP_MESSAGE_IO_STATE_CHUNK,
-	SOUP_MESSAGE_IO_STATE_CHUNK_END,
+	SOUP_MESSAGE_IO_STATE_BODY_DONE,
 	SOUP_MESSAGE_IO_STATE_TRAILERS,
 	SOUP_MESSAGE_IO_STATE_FINISHING,
 	SOUP_MESSAGE_IO_STATE_DONE
@@ -50,6 +49,7 @@ typedef struct {
 	GCancellable         *cancellable;
 
 	SoupSocket           *sock;
+	SoupInputStream      *istream;
 	SoupOutputStream     *ostream;
 	GMainContext         *async_context;
 	gboolean              blocking;
@@ -73,8 +73,7 @@ typedef struct {
 	goffset               write_length;
 	goffset               written;
 
-	guint read_tag;
-	GSource *write_source;
+	GSource *read_source, *write_source;
 	GSource *unpause_source;
 	gboolean paused;
 
@@ -111,11 +110,15 @@ soup_message_io_cleanup (SoupMessage *msg)
 
 	if (io->sock) {
 		if (soup_socket_is_connected (io->sock)) {
+			soup_input_stream_set_encoding (io->istream,
+							SOUP_ENCODING_NONE, 0);
 			soup_output_stream_set_encoding (io->ostream,
 							 SOUP_ENCODING_NONE);
 		}
 		g_object_unref (io->sock);
 	}
+	if (io->istream)
+		g_object_remove_weak_pointer (G_OBJECT (io->istream), (gpointer *)&io->istream);
 	if (io->ostream)
 		g_object_remove_weak_pointer (G_OBJECT (io->ostream), (gpointer *)&io->ostream);
 	if (io->async_context)
@@ -144,9 +147,9 @@ soup_message_io_stop (SoupMessage *msg)
 	if (!io)
 		return;
 
-	if (io->read_tag) {
-		g_signal_handler_disconnect (io->sock, io->read_tag);
-		io->read_tag = 0;
+	if (io->read_source) {
+		g_source_destroy (io->read_source);
+		io->read_source = NULL;
 	}
 	if (io->write_source) {
 		g_source_destroy (io->write_source);
@@ -161,9 +164,6 @@ soup_message_io_stop (SoupMessage *msg)
 	if (io->read_state < SOUP_MESSAGE_IO_STATE_FINISHING)
 		soup_socket_disconnect (io->sock);
 }
-
-#define SOUP_MESSAGE_IO_EOL            "\r\n"
-#define SOUP_MESSAGE_IO_EOL_LEN        2
 
 void
 soup_message_io_finished (SoupMessage *msg)
@@ -180,7 +180,7 @@ soup_message_io_finished (SoupMessage *msg)
 	g_object_unref (msg);
 }
 
-static void io_read (SoupSocket *sock, SoupMessage *msg);
+static gboolean io_read (SoupInputStream *stream, SoupMessage *msg);
 static gboolean io_write (SoupOutputStream *stream, SoupMessage *msg);
 
 static gboolean
@@ -267,6 +267,20 @@ io_handle_sniffing (SoupMessage *msg, gboolean done_reading)
 }
 
 static void
+setup_read_source (SoupMessage *msg)
+{
+	SoupMessagePrivate *priv = SOUP_MESSAGE_GET_PRIVATE (msg);
+	SoupMessageIOData *io = priv->io_data;
+
+	io->read_source = g_pollable_input_stream_create_source (
+		G_POLLABLE_INPUT_STREAM (io->istream), NULL);
+	g_source_set_callback (io->read_source,
+			       (GSourceFunc) io_read, msg, NULL);
+	g_source_attach (io->read_source, io->async_context);
+	g_source_unref (io->read_source);
+}
+
+static void
 setup_write_source (SoupMessage *msg)
 {
 	SoupMessagePrivate *priv = SOUP_MESSAGE_GET_PRIVATE (msg);
@@ -279,9 +293,8 @@ setup_write_source (SoupMessage *msg)
 	g_source_attach (io->write_source, io->async_context);
 }
 
-/* Reads data from io->sock into io->read_meta_buf. If @to_blank is
- * %TRUE, it reads up until a blank line ("CRLF CRLF" or "LF LF").
- * Otherwise, it reads up until a single CRLF or LF.
+/* Reads data from io->sock into io->read_meta_buf, up until a blank
+ * line ("CRLF CRLF" or "LF LF").
  *
  * This function is used to read metadata, and read_body_chunk() is
  * used to read the message body contents.
@@ -297,56 +310,40 @@ setup_write_source (SoupMessage *msg)
  * function returns %FALSE, the caller should return immediately.
  */
 static gboolean
-read_metadata (SoupMessage *msg, gboolean to_blank)
+read_metadata (SoupMessage *msg)
 {
 	SoupMessagePrivate *priv = SOUP_MESSAGE_GET_PRIVATE (msg);
 	SoupMessageIOData *io = priv->io_data;
-	SoupSocketIOStatus status;
 	guchar read_buf[RESPONSE_BLOCK_SIZE];
-	gsize nread;
+	gssize nread;
 	gboolean got_lf;
 	GError *error = NULL;
 
+	if (!io->istream) {
+		io_error (io->sock, msg, NULL);
+		return FALSE;
+	}
+
 	while (1) {
-		status = soup_socket_read_until (io->sock, read_buf,
-						 sizeof (read_buf),
-						 "\n", 1, &nread, &got_lf,
-						 io->cancellable, &error);
-		switch (status) {
-		case SOUP_SOCKET_OK:
-			g_byte_array_append (io->read_meta_buf, read_buf, nread);
-			break;
+		nread = soup_input_stream_read_line (io->istream,
+						     read_buf, sizeof (read_buf),
+						     io->cancellable, &error);
 
-		case SOUP_SOCKET_EOF:
-			/* More lame server handling... deal with
-			 * servers that don't send the final chunk.
-			 */
-			if (io->read_state == SOUP_MESSAGE_IO_STATE_CHUNK_SIZE &&
-			    io->read_meta_buf->len == 0) {
-				g_byte_array_append (io->read_meta_buf,
-						     (guchar *)"0\r\n", 3);
-				got_lf = TRUE;
-				break;
-			} else if (io->read_state == SOUP_MESSAGE_IO_STATE_TRAILERS &&
-				   io->read_meta_buf->len == 0) {
-				g_byte_array_append (io->read_meta_buf,
-						     (guchar *)"\r\n", 2);
-				got_lf = TRUE;
-				break;
-			}
-			/* else fall through */
-
-		case SOUP_SOCKET_ERROR:
-			io_error (io->sock, msg, error);
+		if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_WOULD_BLOCK)) {
+			g_error_free (error);
+			setup_read_source (msg);
 			return FALSE;
+		}
 
-		case SOUP_SOCKET_WOULD_BLOCK:
+		if (nread > 0) {
+			g_byte_array_append (io->read_meta_buf, read_buf, nread);
+			got_lf = memchr (read_buf, '\n', nread) != NULL;
+		} else {
+			io_error (io->sock, msg, error);
 			return FALSE;
 		}
 
 		if (got_lf) {
-			if (!to_blank)
-				break;
 			if (nread == 1 &&
 			    !strncmp ((char *)io->read_meta_buf->data +
 				      io->read_meta_buf->len - 2,
@@ -442,104 +439,6 @@ content_decode (SoupMessage *msg, SoupBuffer *buf)
 	return buf;
 }
 
-/* Reads as much message body data as is available on io->sock (but no
- * further than the end of the current message body or chunk). On a
- * successful read, emits "got_chunk" (possibly multiple times), and
- * (unless told not to) appends the chunk to io->read_body.
- *
- * See the note at read_metadata() for an explanation of the return
- * value.
- */
-static gboolean
-read_body_chunk (SoupMessage *msg)
-{
-	SoupMessagePrivate *priv = SOUP_MESSAGE_GET_PRIVATE (msg);
-	SoupMessageIOData *io = priv->io_data;
-	SoupSocketIOStatus status;
-	guchar *stack_buf = NULL;
-	gsize len;
-	gboolean read_to_eof = (io->read_encoding == SOUP_ENCODING_EOF);
-	gsize nread;
-	GError *error = NULL;
-	SoupBuffer *buffer;
-
-	if (!io_handle_sniffing (msg, FALSE))
-		return FALSE;
-
-	while (read_to_eof || io->read_length > 0) {
-		if (priv->chunk_allocator) {
-			buffer = priv->chunk_allocator (msg, io->read_length, priv->chunk_allocator_data);
-			if (!buffer) {
-				soup_message_io_pause (msg);
-				return FALSE;
-			}
-		} else {
-			if (!stack_buf)
-				stack_buf = alloca (RESPONSE_BLOCK_SIZE);
-			buffer = soup_buffer_new (SOUP_MEMORY_TEMPORARY,
-						  stack_buf,
-						  RESPONSE_BLOCK_SIZE);
-		}
-
-		if (read_to_eof)
-			len = buffer->length;
-		else
-			len = MIN (buffer->length, io->read_length);
-
-		status = soup_socket_read (io->sock,
-					   (guchar *)buffer->data, len,
-					   &nread, io->cancellable, &error);
-
-		if (status == SOUP_SOCKET_OK && nread) {
-			buffer->length = nread;
-			io->read_length -= nread;
-
-			buffer = content_decode (msg, buffer);
-			if (!buffer)
-				continue;
-
-			soup_message_body_got_chunk (io->read_body, buffer);
-
-			if (io->need_content_sniffed) {
-				soup_message_body_append_buffer (io->sniff_data, buffer);
-				soup_buffer_free (buffer);
-				io->need_got_chunk = TRUE;
-				if (!io_handle_sniffing (msg, FALSE))
-					return FALSE;
-				continue;
-			}
-
-			SOUP_MESSAGE_IO_PREPARE_FOR_CALLBACK;
-			soup_message_got_chunk (msg, buffer);
-			soup_buffer_free (buffer);
-			SOUP_MESSAGE_IO_RETURN_VAL_IF_CANCELLED_OR_PAUSED (FALSE);
-			continue;
-		}
-
-		soup_buffer_free (buffer);
-		switch (status) {
-		case SOUP_SOCKET_OK:
-			break;
-
-		case SOUP_SOCKET_EOF:
-			if (io->read_eof_ok) {
-				io->read_length = 0;
-				return TRUE;
-			}
-			/* else fall through */
-
-		case SOUP_SOCKET_ERROR:
-			io_error (io->sock, msg, error);
-			return FALSE;
-
-		case SOUP_SOCKET_WOULD_BLOCK:
-			return FALSE;
-		}
-	}
-
-	return TRUE;
-}
-
 static gssize
 do_write (SoupMessage *msg, const char *data, guint len)
 {
@@ -570,15 +469,6 @@ do_write (SoupMessage *msg, const char *data, guint len)
 
 	io->written += nwrote;
 	return nwrote;
-}
-
-static inline SoupMessageIOState
-io_body_state (SoupEncoding encoding)
-{
-	if (encoding == SOUP_ENCODING_CHUNKED)
-		return SOUP_MESSAGE_IO_STATE_CHUNK_SIZE;
-	else
-		return SOUP_MESSAGE_IO_STATE_BODY;
 }
 
 /*
@@ -666,7 +556,7 @@ io_write (SoupOutputStream *stream, SoupMessage *msg)
 				/* Stop and wait for the body now */
 				io->write_state =
 					SOUP_MESSAGE_IO_STATE_BLOCKING;
-				io->read_state = io_body_state (io->read_encoding);
+				io->read_state = SOUP_MESSAGE_IO_STATE_BODY;
 			} else {
 				/* We just wrote a 1xx response
 				 * header, so stay in STATE_HEADERS.
@@ -702,7 +592,7 @@ io_write (SoupOutputStream *stream, SoupMessage *msg)
 
 
 	case SOUP_MESSAGE_IO_STATE_BLOCKING:
-		io_read (io->sock, msg);
+		io_read (io->istream, msg);
 
 		/* If io_read reached a point where we could write
 		 * again, it would have recursively called io_write.
@@ -791,7 +681,7 @@ io_write (SoupOutputStream *stream, SoupMessage *msg)
 
 		if (io->mode == SOUP_MESSAGE_IO_CLIENT) {
 			io->read_state = SOUP_MESSAGE_IO_STATE_HEADERS;
-			io_read (io->sock, msg);
+			io_read (io->istream, msg);
 		} else
 			soup_message_io_finished (msg);
 		goto out;
@@ -810,22 +700,33 @@ io_write (SoupOutputStream *stream, SoupMessage *msg)
 	return FALSE;
 }
 
-static void
-io_read (SoupSocket *sock, SoupMessage *msg)
+static gboolean
+io_read (SoupInputStream *stream, SoupMessage *msg)
 {
 	SoupMessagePrivate *priv = SOUP_MESSAGE_GET_PRIVATE (msg);
 	SoupMessageIOData *io = priv->io_data;
+	guchar *stack_buf = NULL;
+	gssize nread;
+	GError *error = NULL;
+	SoupBuffer *buffer;
 	guint status;
+
+	if (io->read_source) {
+		g_source_destroy (io->read_source);
+		io->read_source = NULL;
+	}
+
+	g_object_ref (msg);
 
  read_more:
 	switch (io->read_state) {
 	case SOUP_MESSAGE_IO_STATE_NOT_STARTED:
-		return;
+		goto out;
 
 
 	case SOUP_MESSAGE_IO_STATE_HEADERS:
-		if (!read_metadata (msg, TRUE))
-			return;
+		if (!read_metadata (msg))
+			goto out;
 
 		/* We need to "rewind" io->read_meta_buf back one line.
 		 * That SHOULD be two characters (CR LF), but if the
@@ -878,6 +779,10 @@ io_read (SoupSocket *sock, SoupMessage *msg)
 			}
 		}
 
+		soup_input_stream_set_encoding (io->istream,
+						io->read_encoding,
+						io->read_length);
+
 		if (io->mode == SOUP_MESSAGE_IO_CLIENT &&
 		    SOUP_STATUS_IS_INFORMATIONAL (msg->status_code)) {
 			if (msg->status_code == SOUP_STATUS_CONTINUE &&
@@ -901,7 +806,7 @@ io_read (SoupSocket *sock, SoupMessage *msg)
 			io->write_state = SOUP_MESSAGE_IO_STATE_HEADERS;
 			io->read_state = SOUP_MESSAGE_IO_STATE_BLOCKING;
 		} else {
-			io->read_state = io_body_state (io->read_encoding);
+			io->read_state = SOUP_MESSAGE_IO_STATE_BODY;
 
 			/* If the client was waiting for a Continue
 			 * but got something else, then it's done
@@ -914,15 +819,10 @@ io_read (SoupSocket *sock, SoupMessage *msg)
 
 		if (io->mode == SOUP_MESSAGE_IO_CLIENT &&
 		    SOUP_STATUS_IS_INFORMATIONAL (msg->status_code)) {
-			SOUP_MESSAGE_IO_PREPARE_FOR_CALLBACK;
 			soup_message_got_informational (msg);
 			soup_message_cleanup_response (msg);
-			SOUP_MESSAGE_IO_RETURN_IF_CANCELLED_OR_PAUSED;
-		} else {
-			SOUP_MESSAGE_IO_PREPARE_FOR_CALLBACK;
+		} else
 			soup_message_got_headers (msg);
-			SOUP_MESSAGE_IO_RETURN_IF_CANCELLED_OR_PAUSED;
-		}
 		break;
 
 
@@ -930,84 +830,104 @@ io_read (SoupSocket *sock, SoupMessage *msg)
 		io_write (io->ostream, msg);
 
 		/* As in the io_write case, we *must* return here. */
-		return;
+		goto out;
 
 
 	case SOUP_MESSAGE_IO_STATE_BODY:
-		if (!read_body_chunk (msg))
-			return;
-
-	got_body:
-		if (!io_handle_sniffing (msg, TRUE)) {
-			/* If the message was paused (as opposed to
-			 * cancelled), we need to make sure we wind up
-			 * back here when it's unpaused, even if it
-			 * was doing a chunked or EOF-terminated read
-			 * before.
-			 */
-			if (io == priv->io_data) {
-				io->read_state = SOUP_MESSAGE_IO_STATE_BODY;
-				io->read_encoding = SOUP_ENCODING_CONTENT_LENGTH;
-				io->read_length = 0;
-			}
-			return;
+		if (!io->istream) {
+			io_error (io->sock, msg, NULL);
+			goto out;
 		}
 
+		if (io->read_encoding == SOUP_ENCODING_NONE ||
+		    (io->read_encoding == SOUP_ENCODING_CONTENT_LENGTH &&
+		     io->read_length == 0))
+			goto read_done;
+
+		if (!io_handle_sniffing (msg, FALSE))
+			goto out;
+
+		if (priv->chunk_allocator) {
+			buffer = priv->chunk_allocator (msg, io->read_length, priv->chunk_allocator_data);
+			if (!buffer) {
+				soup_message_io_pause (msg);
+				goto out;
+			}
+		} else {
+			if (!stack_buf)
+				stack_buf = alloca (RESPONSE_BLOCK_SIZE);
+			buffer = soup_buffer_new (SOUP_MEMORY_TEMPORARY,
+						  stack_buf,
+						  RESPONSE_BLOCK_SIZE);
+		}
+
+		nread = g_input_stream_read (G_INPUT_STREAM (io->istream),
+					     (guchar *)buffer->data,
+					     buffer->length,
+					     io->cancellable, &error);
+		if (nread > 0) {
+			buffer->length = nread;
+			io->read_length -= nread;
+
+			buffer = content_decode (msg, buffer);
+			if (!buffer)
+				break;
+
+			soup_message_body_got_chunk (io->read_body, buffer);
+
+			if (io->need_content_sniffed) {
+				soup_message_body_append_buffer (io->sniff_data, buffer);
+				soup_buffer_free (buffer);
+				io->need_got_chunk = TRUE;
+				if (!io_handle_sniffing (msg, FALSE))
+					goto out;
+				break;
+			}
+
+			soup_message_got_chunk (msg, buffer);
+			soup_buffer_free (buffer);
+			break;
+		}
+
+		soup_buffer_free (buffer);
+
+		if (nread == 0)
+			goto read_done;
+
+		if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_WOULD_BLOCK)) {
+			g_error_free (error);
+			setup_read_source (msg);
+			goto out;
+		} else if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_PARTIAL_INPUT)) {
+			g_clear_error (&error);
+			if (io->read_eof_ok) {
+				io->read_length = 0;
+				goto read_done;
+			}
+			/* else... */
+		}
+
+		io_error (io->sock, msg, error);
+		goto out;
+
+	read_done:
+		io->read_state = SOUP_MESSAGE_IO_STATE_BODY_DONE;
+		break;
+
+
+	case SOUP_MESSAGE_IO_STATE_BODY_DONE:
+		if (!io_handle_sniffing (msg, TRUE))
+			goto out;
+
 		io->read_state = SOUP_MESSAGE_IO_STATE_FINISHING;
-
-		SOUP_MESSAGE_IO_PREPARE_FOR_CALLBACK;
 		soup_message_got_body (msg);
-		SOUP_MESSAGE_IO_RETURN_IF_CANCELLED_OR_PAUSED;
-		break;
-
-
-	case SOUP_MESSAGE_IO_STATE_CHUNK_SIZE:
-		if (!read_metadata (msg, FALSE))
-			return;
-
-		io->read_length = strtoul ((char *)io->read_meta_buf->data, NULL, 16);
-		g_byte_array_set_size (io->read_meta_buf, 0);
-
-		if (io->read_length > 0)
-			io->read_state = SOUP_MESSAGE_IO_STATE_CHUNK;
-		else
-			io->read_state = SOUP_MESSAGE_IO_STATE_TRAILERS;
-		break;
-
-
-	case SOUP_MESSAGE_IO_STATE_CHUNK:
-		if (!read_body_chunk (msg))
-			return;
-
-		io->read_state = SOUP_MESSAGE_IO_STATE_CHUNK_END;
-		break;
-
-
-	case SOUP_MESSAGE_IO_STATE_CHUNK_END:
-		if (!read_metadata (msg, FALSE))
-			return;
-
-		g_byte_array_set_size (io->read_meta_buf, 0);
-		io->read_state = SOUP_MESSAGE_IO_STATE_CHUNK_SIZE;
-		break;
-
-
-	case SOUP_MESSAGE_IO_STATE_TRAILERS:
-		if (!read_metadata (msg, FALSE))
-			return;
-
-		if (io->read_meta_buf->len <= SOUP_MESSAGE_IO_EOL_LEN)
-			goto got_body;
-
-		/* FIXME: process trailers */
-		g_byte_array_set_size (io->read_meta_buf, 0);
 		break;
 
 
 	case SOUP_MESSAGE_IO_STATE_FINISHING:
-		if (io->read_tag) {
-			g_signal_handler_disconnect (io->sock, io->read_tag);
-			io->read_tag = 0;
+		if (io->read_source) {
+			g_source_destroy (io->read_source);
+			io->read_source = NULL;
 		}
 		io->read_state = SOUP_MESSAGE_IO_STATE_DONE;
 
@@ -1016,15 +936,20 @@ io_read (SoupSocket *sock, SoupMessage *msg)
 			io_write (io->ostream, msg);
 		} else
 			soup_message_io_finished (msg);
-		return;
+		goto out;
 
 
 	case SOUP_MESSAGE_IO_STATE_DONE:
 	default:
-		g_return_if_reached ();
+		g_return_val_if_reached (FALSE);
 	}
 
-	goto read_more;
+	if (priv->io_data == io && !io->paused)
+		goto read_more;
+
+ out:
+	g_object_unref (msg);
+	return FALSE;
 }
 
 static SoupMessageIOData *
@@ -1048,6 +973,9 @@ new_iostate (SoupMessage *msg, SoupSocket *sock, SoupMessageIOMode mode,
 	io->completion_data  = completion_data;
 
 	io->sock = g_object_ref (sock);
+	io->istream = SOUP_INPUT_STREAM (soup_socket_get_input_stream (sock));
+	if (io->istream)
+		g_object_add_weak_pointer (G_OBJECT (io->istream), (gpointer *)&io->istream);
 	io->ostream = SOUP_OUTPUT_STREAM (soup_socket_get_output_stream (sock));
 	if (io->ostream)
 		g_object_add_weak_pointer (G_OBJECT (io->ostream), (gpointer *)&io->ostream);
@@ -1060,9 +988,6 @@ new_iostate (SoupMessage *msg, SoupSocket *sock, SoupMessageIOMode mode,
 
 	io->read_meta_buf    = g_byte_array_new ();
 	io->write_buf        = g_string_new (NULL);
-
-	io->read_tag  = g_signal_connect (io->sock, "readable",
-					  G_CALLBACK (io_read), msg);
 
 	io->read_state  = SOUP_MESSAGE_IO_STATE_NOT_STARTED;
 	io->write_state = SOUP_MESSAGE_IO_STATE_NOT_STARTED;
@@ -1117,7 +1042,7 @@ soup_message_io_server (SoupMessage *msg, SoupSocket *sock,
 	io->write_body      = msg->response_body;
 
 	io->read_state      = SOUP_MESSAGE_IO_STATE_HEADERS;
-	io_read (sock, msg);
+	io_read (io->istream, msg);
 }
 
 void  
@@ -1132,9 +1057,9 @@ soup_message_io_pause (SoupMessage *msg)
 		g_source_destroy (io->write_source);
 		io->write_source = NULL;
 	}
-	if (io->read_tag) {
-		g_signal_handler_disconnect (io->sock, io->read_tag);
-		io->read_tag = 0;
+	if (io->read_source) {
+		g_source_destroy (io->read_source);
+		io->read_source = NULL;
 	}
 
 	if (io->unpause_source) {
@@ -1155,18 +1080,13 @@ io_unpause_internal (gpointer msg)
 	io->unpause_source = NULL;
 	io->paused = FALSE;
 
-	if (io->write_source || io->read_tag)
+	if (io->write_source || io->read_source)
 		return FALSE;
-
-	if (io->read_state != SOUP_MESSAGE_IO_STATE_DONE) {
-		io->read_tag = g_signal_connect (io->sock, "readable",
-						 G_CALLBACK (io_read), msg);
-	}
 
 	if (SOUP_MESSAGE_IO_STATE_ACTIVE (io->write_state))
 		io_write (io->ostream, msg);
 	else if (SOUP_MESSAGE_IO_STATE_ACTIVE (io->read_state))
-		io_read (io->sock, msg);
+		io_read (io->istream, msg);
 
 	return FALSE;
 }
