@@ -32,6 +32,8 @@ typedef enum {
 	SOUP_MESSAGE_IO_STATE_HEADERS,
 	SOUP_MESSAGE_IO_STATE_BLOCKING,
 	SOUP_MESSAGE_IO_STATE_BODY_START,
+	SOUP_MESSAGE_IO_STATE_SNIFFING,
+	SOUP_MESSAGE_IO_STATE_SNIFFED,
 	SOUP_MESSAGE_IO_STATE_BODY,
 	SOUP_MESSAGE_IO_STATE_BODY_DATA,
 	SOUP_MESSAGE_IO_STATE_BODY_DONE,
@@ -65,7 +67,6 @@ typedef struct {
 	gboolean              read_eof_ok;
 	gboolean              read_done;
 
-	gboolean              need_content_sniffed, need_got_chunk;
 	SoupMessageBody      *sniff_data;
 
 	SoupMessageIOState    write_state;
@@ -88,14 +89,6 @@ typedef struct {
 	gpointer                  completion_data;
 } SoupMessageIOData;
 	
-
-/* Put these around callback invocation if there is code afterward
- * that depends on the IO having not been cancelled.
- */
-#define dummy_to_make_emacs_happy {
-#define SOUP_MESSAGE_IO_PREPARE_FOR_CALLBACK { gboolean cancelled; g_object_ref (msg);
-#define SOUP_MESSAGE_IO_RETURN_IF_CANCELLED_OR_PAUSED cancelled = (priv->io_data != io); g_object_unref (msg); if (cancelled || io->paused) return; }
-#define SOUP_MESSAGE_IO_RETURN_VAL_IF_CANCELLED_OR_PAUSED(val) cancelled = (priv->io_data != io); g_object_unref (msg); if (cancelled || io->paused) return val; }
 
 #define RESPONSE_BLOCK_SIZE 8192
 
@@ -221,55 +214,6 @@ io_error (SoupSocket *sock, SoupMessage *msg, GError *error)
 		g_error_free (error);
 
 	soup_message_io_finished (msg);
-}
-
-static gboolean
-io_handle_sniffing (SoupMessage *msg, gboolean done_reading)
-{
-	SoupMessagePrivate *priv = SOUP_MESSAGE_GET_PRIVATE (msg);
-	SoupMessageIOData *io = priv->io_data;
-	SoupBuffer *sniffed_buffer;
-	char *sniffed_mime_type;
-	GHashTable *params = NULL;
-
-	if (!priv->sniffer)
-		return TRUE;
-
-	if (!io->sniff_data) {
-		io->sniff_data = soup_message_body_new ();
-		io->need_content_sniffed = TRUE;
-	}
-
-	if (io->need_content_sniffed) {
-		if (io->sniff_data->length < priv->bytes_for_sniffing &&
-		    !done_reading)
-			return TRUE;
-
-		io->need_content_sniffed = FALSE;
-		sniffed_buffer = soup_message_body_flatten (io->sniff_data);
-		sniffed_mime_type = soup_content_sniffer_sniff (priv->sniffer, msg, sniffed_buffer, &params);
-
-		SOUP_MESSAGE_IO_PREPARE_FOR_CALLBACK;
-		soup_message_content_sniffed (msg, sniffed_mime_type, params);
-		g_free (sniffed_mime_type);
-		if (params)
-			g_hash_table_destroy (params);
-		if (sniffed_buffer)
-			soup_buffer_free (sniffed_buffer);
-		SOUP_MESSAGE_IO_RETURN_VAL_IF_CANCELLED_OR_PAUSED (FALSE);
-	}
-
-	if (io->need_got_chunk) {
-		io->need_got_chunk = FALSE;
-		sniffed_buffer = soup_message_body_flatten (io->sniff_data);
-
-		SOUP_MESSAGE_IO_PREPARE_FOR_CALLBACK;
-		soup_message_got_chunk (msg, sniffed_buffer);
-		soup_buffer_free (sniffed_buffer);
-		SOUP_MESSAGE_IO_RETURN_VAL_IF_CANCELLED_OR_PAUSED (FALSE);
-	}
-
-	return TRUE;
 }
 
 static void
@@ -714,6 +658,8 @@ io_read (SoupInputStream *stream, SoupMessage *msg)
 	guchar *stack_buf = NULL;
 	SoupBuffer *buffer;
 	guint status;
+	char *sniffed_mime_type;
+	GHashTable *params = NULL;
 
 	if (io->read_source) {
 		g_source_destroy (io->read_source);
@@ -840,14 +786,59 @@ io_read (SoupInputStream *stream, SoupMessage *msg)
 	case SOUP_MESSAGE_IO_STATE_BODY_START:
 		if (io->read_encoding == SOUP_ENCODING_NONE ||
 		    (io->read_encoding == SOUP_ENCODING_CONTENT_LENGTH &&
-		     io->read_length == 0)) {
+		     io->read_length == 0))
+			io->read_done = TRUE;
+
+		if (priv->sniffer) {
+			io->sniff_data = soup_message_body_new ();
+			io->read_state = SOUP_MESSAGE_IO_STATE_SNIFFING;
+		} else if (io->read_done)
 			io->read_state = SOUP_MESSAGE_IO_STATE_BODY_DONE;
-			break;
-		}
-		io->read_state = SOUP_MESSAGE_IO_STATE_BODY;
+		else
+			io->read_state = SOUP_MESSAGE_IO_STATE_BODY;
 
 		setup_body_istream (msg);
-		/* fall through */
+		break;
+
+
+	case SOUP_MESSAGE_IO_STATE_SNIFFING:
+		if (!io->istream) {
+			io_error (io->sock, msg, NULL);
+			goto out;
+		}
+
+		if (!priv->chunk_allocator && !stack_buf)
+			stack_buf = alloca (RESPONSE_BLOCK_SIZE);
+
+		buffer = do_read (msg, stack_buf, RESPONSE_BLOCK_SIZE);
+		if (buffer) {
+			soup_message_body_append_buffer (io->sniff_data, buffer);
+			soup_buffer_free (buffer);
+		} else if (!io->read_done)
+			goto out;
+
+		if (io->sniff_data->length < priv->bytes_for_sniffing &&
+		    !io->read_done)
+			break;
+
+		buffer = soup_message_body_flatten (io->sniff_data);
+		sniffed_mime_type = soup_content_sniffer_sniff (priv->sniffer, msg, buffer, &params);
+
+		io->read_state = SOUP_MESSAGE_IO_STATE_SNIFFED;
+		soup_message_content_sniffed (msg, sniffed_mime_type, params);
+		g_free (sniffed_mime_type);
+		if (params)
+			g_hash_table_destroy (params);
+		soup_buffer_free (buffer);
+		break;
+
+
+	case SOUP_MESSAGE_IO_STATE_SNIFFED:
+		io->read_state = SOUP_MESSAGE_IO_STATE_BODY;
+		buffer = soup_message_body_flatten (io->sniff_data);
+		soup_message_got_chunk (msg, buffer);
+		soup_buffer_free (buffer);
+		break;
 
 
 	case SOUP_MESSAGE_IO_STATE_BODY:
@@ -855,9 +846,6 @@ io_read (SoupInputStream *stream, SoupMessage *msg)
 			io_error (io->sock, msg, NULL);
 			goto out;
 		}
-
-		if (!io_handle_sniffing (msg, FALSE))
-			goto out;
 
 		if (!priv->chunk_allocator && !stack_buf)
 			stack_buf = alloca (RESPONSE_BLOCK_SIZE);
@@ -871,24 +859,12 @@ io_read (SoupInputStream *stream, SoupMessage *msg)
 				goto out;
 		}
 
-		if (io->need_content_sniffed) {
-			soup_message_body_append_buffer (io->sniff_data, buffer);
-			soup_buffer_free (buffer);
-			io->need_got_chunk = TRUE;
-			if (!io_handle_sniffing (msg, FALSE))
-				goto out;
-			break;
-		}
-
 		soup_message_got_chunk (msg, buffer);
 		soup_buffer_free (buffer);
 		break;
 
 
 	case SOUP_MESSAGE_IO_STATE_BODY_DONE:
-		if (!io_handle_sniffing (msg, TRUE))
-			goto out;
-
 		io->read_state = SOUP_MESSAGE_IO_STATE_FINISHING;
 		soup_message_got_body (msg);
 		break;
