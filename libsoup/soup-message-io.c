@@ -31,6 +31,7 @@ typedef enum {
 	SOUP_MESSAGE_IO_STATE_NOT_STARTED,
 	SOUP_MESSAGE_IO_STATE_HEADERS,
 	SOUP_MESSAGE_IO_STATE_BLOCKING,
+	SOUP_MESSAGE_IO_STATE_BODY_START,
 	SOUP_MESSAGE_IO_STATE_BODY,
 	SOUP_MESSAGE_IO_STATE_BODY_DATA,
 	SOUP_MESSAGE_IO_STATE_BODY_DONE,
@@ -62,6 +63,7 @@ typedef struct {
 	SoupMessageBody      *read_body;
 	goffset               read_length;
 	gboolean              read_eof_ok;
+	gboolean              read_done;
 
 	gboolean              need_content_sniffed, need_got_chunk;
 	SoupMessageBody      *sniff_data;
@@ -388,6 +390,61 @@ setup_body_istream (SoupMessage *msg)
 	}
 }
 
+static SoupBuffer *
+do_read (SoupMessage *msg, guchar *read_buf, guint len)
+{
+	SoupMessagePrivate *priv = SOUP_MESSAGE_GET_PRIVATE (msg);
+	SoupMessageIOData *io = priv->io_data;
+	SoupBuffer *buffer;
+	gssize nread;
+	GError *error = NULL;
+
+	if (priv->chunk_allocator) {
+		buffer = priv->chunk_allocator (msg, io->read_length, priv->chunk_allocator_data);
+		if (!buffer) {
+			soup_message_io_pause (msg);
+			return NULL;
+		}
+	} else {
+		buffer = soup_buffer_new (SOUP_MEMORY_TEMPORARY,
+					  read_buf, len);
+	}
+
+	nread = g_input_stream_read (io->body_istream,
+				     (guchar *)buffer->data,
+				     buffer->length,
+				     io->cancellable, &error);
+	if (nread > 0) {
+		buffer->length = nread;
+		io->read_length -= nread;
+
+		soup_message_body_got_chunk (io->read_body, buffer);
+		return buffer;
+	}
+	soup_buffer_free (buffer);
+
+	if (nread == 0) {
+		io->read_done = TRUE;
+		return NULL;
+	}
+
+	if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_WOULD_BLOCK)) {
+		g_error_free (error);
+		setup_read_source (msg);
+		return NULL;
+	} else if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_PARTIAL_INPUT)) {
+		g_clear_error (&error);
+		if (io->read_eof_ok) {
+			io->read_done = TRUE;
+			return NULL;
+		}
+		/* else... */
+	}
+
+	io_error (io->sock, msg, error);
+	return NULL;
+}
+
 static gssize
 do_write (SoupMessage *msg, const char *data, guint len)
 {
@@ -505,7 +562,7 @@ io_write (SoupOutputStream *stream, SoupMessage *msg)
 				/* Stop and wait for the body now */
 				io->write_state =
 					SOUP_MESSAGE_IO_STATE_BLOCKING;
-				io->read_state = SOUP_MESSAGE_IO_STATE_BODY;
+				io->read_state = SOUP_MESSAGE_IO_STATE_BODY_START;
 			} else {
 				/* We just wrote a 1xx response
 				 * header, so stay in STATE_HEADERS.
@@ -655,8 +712,6 @@ io_read (SoupInputStream *stream, SoupMessage *msg)
 	SoupMessagePrivate *priv = SOUP_MESSAGE_GET_PRIVATE (msg);
 	SoupMessageIOData *io = priv->io_data;
 	guchar *stack_buf = NULL;
-	gssize nread;
-	GError *error = NULL;
 	SoupBuffer *buffer;
 	guint status;
 
@@ -755,7 +810,7 @@ io_read (SoupInputStream *stream, SoupMessage *msg)
 			io->write_state = SOUP_MESSAGE_IO_STATE_HEADERS;
 			io->read_state = SOUP_MESSAGE_IO_STATE_BLOCKING;
 		} else {
-			io->read_state = SOUP_MESSAGE_IO_STATE_BODY;
+			io->read_state = SOUP_MESSAGE_IO_STATE_BODY_START;
 
 			/* If the client was waiting for a Continue
 			 * but got something else, then it's done
@@ -782,84 +837,51 @@ io_read (SoupInputStream *stream, SoupMessage *msg)
 		goto out;
 
 
+	case SOUP_MESSAGE_IO_STATE_BODY_START:
+		if (io->read_encoding == SOUP_ENCODING_NONE ||
+		    (io->read_encoding == SOUP_ENCODING_CONTENT_LENGTH &&
+		     io->read_length == 0)) {
+			io->read_state = SOUP_MESSAGE_IO_STATE_BODY_DONE;
+			break;
+		}
+		io->read_state = SOUP_MESSAGE_IO_STATE_BODY;
+
+		setup_body_istream (msg);
+		/* fall through */
+
+
 	case SOUP_MESSAGE_IO_STATE_BODY:
 		if (!io->istream) {
 			io_error (io->sock, msg, NULL);
 			goto out;
 		}
 
-		if (io->read_encoding == SOUP_ENCODING_NONE ||
-		    (io->read_encoding == SOUP_ENCODING_CONTENT_LENGTH &&
-		     io->read_length == 0))
-			goto read_done;
-
-		if (!io->body_istream)
-			setup_body_istream (msg);
-
 		if (!io_handle_sniffing (msg, FALSE))
 			goto out;
 
-		if (priv->chunk_allocator) {
-			buffer = priv->chunk_allocator (msg, io->read_length, priv->chunk_allocator_data);
-			if (!buffer) {
-				soup_message_io_pause (msg);
+		if (!priv->chunk_allocator && !stack_buf)
+			stack_buf = alloca (RESPONSE_BLOCK_SIZE);
+
+		buffer = do_read (msg, stack_buf, RESPONSE_BLOCK_SIZE);
+		if (!buffer) {
+			if (io->read_done) {
+				io->read_state = SOUP_MESSAGE_IO_STATE_BODY_DONE;
+				break;
+			} else
 				goto out;
-			}
-		} else {
-			if (!stack_buf)
-				stack_buf = alloca (RESPONSE_BLOCK_SIZE);
-			buffer = soup_buffer_new (SOUP_MEMORY_TEMPORARY,
-						  stack_buf,
-						  RESPONSE_BLOCK_SIZE);
 		}
 
-		nread = g_input_stream_read (io->body_istream,
-					     (guchar *)buffer->data,
-					     buffer->length,
-					     io->cancellable, &error);
-		if (nread > 0) {
-			buffer->length = nread;
-			io->read_length -= nread;
-
-			soup_message_body_got_chunk (io->read_body, buffer);
-
-			if (io->need_content_sniffed) {
-				soup_message_body_append_buffer (io->sniff_data, buffer);
-				soup_buffer_free (buffer);
-				io->need_got_chunk = TRUE;
-				if (!io_handle_sniffing (msg, FALSE))
-					goto out;
-				break;
-			}
-
-			soup_message_got_chunk (msg, buffer);
+		if (io->need_content_sniffed) {
+			soup_message_body_append_buffer (io->sniff_data, buffer);
 			soup_buffer_free (buffer);
+			io->need_got_chunk = TRUE;
+			if (!io_handle_sniffing (msg, FALSE))
+				goto out;
 			break;
 		}
 
+		soup_message_got_chunk (msg, buffer);
 		soup_buffer_free (buffer);
-
-		if (nread == 0)
-			goto read_done;
-
-		if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_WOULD_BLOCK)) {
-			g_error_free (error);
-			setup_read_source (msg);
-			goto out;
-		} else if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_PARTIAL_INPUT)) {
-			g_clear_error (&error);
-			if (io->read_eof_ok) {
-				io->read_length = 0;
-				goto read_done;
-			}
-			/* else... */
-		}
-
-		io_error (io->sock, msg, error);
-		goto out;
-
-	read_done:
-		io->read_state = SOUP_MESSAGE_IO_STATE_BODY_DONE;
 		break;
 
 
