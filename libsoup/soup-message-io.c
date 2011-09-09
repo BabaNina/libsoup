@@ -13,6 +13,7 @@
 #include <string.h>
 
 #include "soup-connection.h"
+#include "soup-content-sniffer-stream.h"
 #include "soup-converter-wrapper.h"
 #include "soup-input-stream.h"
 #include "soup-message.h"
@@ -67,7 +68,8 @@ typedef struct {
 	gboolean              read_eof_ok;
 	gboolean              read_done;
 
-	SoupMessageBody      *sniff_data;
+	SoupContentSnifferStream *sniffer_stream;
+	SoupBuffer           *sniffed_buffer;
 
 	SoupMessageIOState    write_state;
 	SoupEncoding          write_encoding;
@@ -131,8 +133,8 @@ soup_message_io_cleanup (SoupMessage *msg)
 	if (io->write_chunk)
 		soup_buffer_free (io->write_chunk);
 
-	if (io->sniff_data)
-		soup_message_body_free (io->sniff_data);
+	if (io->sniffed_buffer)
+		soup_buffer_free (io->sniffed_buffer);
 
 	g_slice_free (SoupMessageIOData, io);
 }
@@ -329,6 +331,14 @@ setup_body_istream (SoupMessage *msg)
 				       "close-base-stream", FALSE,
 				       "converter", wrapper,
 				       NULL);
+		g_object_unref (io->body_istream);
+		io->body_istream = filter;
+	}
+
+	if (priv->sniffer) {
+		filter = soup_content_sniffer_stream_new (priv->sniffer,
+							  msg, io->body_istream);
+		io->sniffer_stream = SOUP_CONTENT_SNIFFER_STREAM (filter);
 		g_object_unref (io->body_istream);
 		io->body_istream = filter;
 	}
@@ -658,7 +668,7 @@ io_read (SoupInputStream *stream, SoupMessage *msg)
 	guchar *stack_buf = NULL;
 	SoupBuffer *buffer;
 	guint status;
-	char *sniffed_mime_type;
+	const char *sniffed_mime_type;
 	GHashTable *params = NULL;
 
 	if (io->read_source) {
@@ -789,10 +799,9 @@ io_read (SoupInputStream *stream, SoupMessage *msg)
 		     io->read_length == 0))
 			io->read_done = TRUE;
 
-		if (priv->sniffer) {
-			io->sniff_data = soup_message_body_new ();
+		if (priv->sniffer)
 			io->read_state = SOUP_MESSAGE_IO_STATE_SNIFFING;
-		} else if (io->read_done)
+		else if (io->read_done)
 			io->read_state = SOUP_MESSAGE_IO_STATE_BODY_DONE;
 		else
 			io->read_state = SOUP_MESSAGE_IO_STATE_BODY;
@@ -810,34 +819,24 @@ io_read (SoupInputStream *stream, SoupMessage *msg)
 		if (!priv->chunk_allocator && !stack_buf)
 			stack_buf = alloca (RESPONSE_BLOCK_SIZE);
 
-		buffer = do_read (msg, stack_buf, RESPONSE_BLOCK_SIZE);
-		if (buffer) {
-			soup_message_body_append_buffer (io->sniff_data, buffer);
-			soup_buffer_free (buffer);
-		} else if (!io->read_done)
+		io->sniffed_buffer = do_read (msg, stack_buf, RESPONSE_BLOCK_SIZE);
+		if (!io->sniffed_buffer && !io->read_done)
 			goto out;
 
-		if (io->sniff_data->length < priv->bytes_for_sniffing &&
-		    !io->read_done)
-			break;
-
-		buffer = soup_message_body_flatten (io->sniff_data);
-		sniffed_mime_type = soup_content_sniffer_sniff (priv->sniffer, msg, buffer, &params);
-
+		sniffed_mime_type = soup_content_sniffer_stream_sniff (io->sniffer_stream, &params);
 		io->read_state = SOUP_MESSAGE_IO_STATE_SNIFFED;
 		soup_message_content_sniffed (msg, sniffed_mime_type, params);
-		g_free (sniffed_mime_type);
-		if (params)
-			g_hash_table_destroy (params);
-		soup_buffer_free (buffer);
 		break;
 
 
 	case SOUP_MESSAGE_IO_STATE_SNIFFED:
 		io->read_state = SOUP_MESSAGE_IO_STATE_BODY;
-		buffer = soup_message_body_flatten (io->sniff_data);
-		soup_message_got_chunk (msg, buffer);
-		soup_buffer_free (buffer);
+		buffer = io->sniffed_buffer;
+		io->sniffed_buffer = NULL;
+		if (buffer) {
+			soup_message_got_chunk (msg, buffer);
+			soup_buffer_free (buffer);
+		}
 		break;
 
 
